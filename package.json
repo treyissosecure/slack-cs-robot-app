@@ -1,17 +1,17 @@
 {
-  "name": "slack-cstask-app",
+  "name": "slack-cs-robot-app",
   "version": "1.0.0",
+  "private": true,
   "main": "index.js",
   "scripts": {
     "start": "node index.js"
   },
   "dependencies": {
     "@slack/bolt": "^3.15.0",
-    "axios": "^1.6.0"
+    "axios": "^1.6.0",
+    "express": "^4.18.2"
+  },
+  "engines": {
+    "node": "22.x"
   }
-}
-"dependencies": {
-  "@slack/bolt": "^3.15.0",
-  "axios": "^1.6.0",
-  "express": "^4.18.2"
 }
