@@ -147,6 +147,8 @@ app.view("cstask_modal_submit", async ({ ack, body, view, client }) => {
   const taskName = view.state.values.task_name_block.task_name_input.value?.trim() || "";
   const description = view.state.values.description_block?.description_input?.value?.trim() || "";
   const ownerSlackUserId = view.state.values.owner_block.owner_user_select.selected_user || "";
+  const userInfo = await client.users.info({ user: ownerSlackUserId });
+  const taskOwnerEmail = userInfo?.user?.profile?.email || null;
 
   // inline validation
   const errors = {};
@@ -167,6 +169,14 @@ app.view("cstask_modal_submit", async ({ ack, body, view, client }) => {
       task_name: taskName,
       description,
       task_owner_slack_user_id: ownerSlackUserId,
+      task_owner_email: taskOwnerEmail,
+      if (!taskOwnerEmail) {
+  await client.chat.postMessage({
+    channel: body.user.id,
+    text: "⚠️ I couldn’t retrieve the selected owner’s email from Slack. An admin may need to grant SyllaBot the users:read.email permission, or choose a different owner."
+  });
+  return;
+}
       submitted_by_slack_user_id: body.user.id,
       submitted_at: new Date().toISOString(),
     },
