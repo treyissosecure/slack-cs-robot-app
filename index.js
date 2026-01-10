@@ -1,122 +1,30 @@
-const { App } = require("@slack/bolt");
+const { App, ExpressReceiver } = require("@slack/bolt");
 const axios = require("axios");
-const express = require("express");
-const crypto = require("crypto");
 
 // ===== CONFIG =====
-// Your Zapier catch hook (hardcoded per your request)
 const ZAPIER_WEBHOOK_URL =
   process.env.ZAPIER_WEBHOOK_URL ||
   "https://hooks.zapier.com/hooks/catch/25767132/ug29zll/";
 
-// Slack signing secret MUST be in env vars
-const SIGNING_SECRET = process.env.SLACK_SIGNING_SECRET;
+// ===== Receiver with split endpoints (Bolt-supported) =====
+// Use endpoints so Slack can hit different URLs for commands vs interactions.
+// This avoids "Could not determine the type..." warnings.  [oai_citation:3‡HackerNoon](https://hackernoon.com/writing-a-slack-bot-that-responds-to-action-commands-v73b3tba?utm_source=chatgpt.com)
+const receiver = new ExpressReceiver({
+  signingSecret: process.env.SLACK_SIGNING_SECRET,
+  endpoints: {
+    commands: "/slack/commands",
+    actions: "/slack/interactions",
+  },
+});
 
-// ===== Slack signature verification =====
-function verifySlackSignature(req, rawBody) {
-  const timestamp = req.headers["x-slack-request-timestamp"];
-  const slackSignature = req.headers["x-slack-signature"];
-
-  if (!timestamp || !slackSignature) return false;
-
-  // Prevent replay attacks (5 minutes)
-  const fiveMinutes = 60 * 5;
-  const now = Math.floor(Date.now() / 1000);
-  if (Math.abs(now - Number(timestamp)) > fiveMinutes) return false;
-
-  const sigBaseString = `v0:${timestamp}:${rawBody}`;
-  const mySignature =
-    "v0=" +
-    crypto
-      .createHmac("sha256", SIGNING_SECRET)
-      .update(sigBaseString, "utf8")
-      .digest("hex");
-
-  try {
-    return crypto.timingSafeEqual(
-      Buffer.from(mySignature, "utf8"),
-      Buffer.from(slackSignature, "utf8")
-    );
-  } catch {
-    return false;
-  }
-}
-
-// ===== Custom receiver with split endpoints =====
-class SplitEndpointsReceiver {
-  constructor() {
-    this.expressApp = express();
-
-    // IMPORTANT: Use raw body so signature verification works
-    this.expressApp.use("/slack", express.raw({ type: "*/*" }));
-
-    this.expressApp.post("/slack/commands", (req, res) =>
-      this.handleSlack(req, res)
-    );
-    this.expressApp.post("/slack/interactions", (req, res) =>
-      this.handleSlack(req, res)
-    );
-
-    // Simple health check
-    this.expressApp.get("/", (req, res) => res.status(200).send("OK"));
-  }
-
-  init(boltApp) {
-    this.bolt = boltApp;
-  }
-
-  start(port) {
-    return new Promise((resolve) => {
-      this.server = this.expressApp.listen(port, () => resolve(this.server));
-    });
-  }
-
-  stop() {
-    return new Promise((resolve, reject) => {
-      this.server.close((err) => (err ? reject(err) : resolve()));
-    });
-  }
-
-  async handleSlack(req, res) {
-    const rawBody = (req.body || Buffer.from("")).toString("utf8");
-
-    // Verify request came from Slack
-    if (!SIGNING_SECRET || !verifySlackSignature(req, rawBody)) {
-      res.status(401).send("Invalid signature");
-      return;
-    }
-
-    // Provide Bolt what it needs: raw body + headers + ack
-    const event = {
-      body: rawBody,
-      headers: req.headers, // ✅ critical so Bolt can classify the request
-      ack: (response) => {
-        if (res.headersSent) return;
-        if (response === undefined) return res.status(200).send("");
-        if (typeof response === "string") return res.status(200).send(response);
-        return res.status(200).json(response);
-      },
-    };
-
-    try {
-      await this.bolt.processEvent(event);
-    } catch (e) {
-      console.error(e);
-      if (!res.headersSent) res.status(500).send("");
-    }
-  }
-}
-
-// ===== Bolt app using the custom receiver =====
-const receiver = new SplitEndpointsReceiver();
-
+// ===== Bolt App =====
 const app = new App({
-  token: process.env.SLACK_BOT_TOKEN, // must be set in Render env vars
+  token: process.env.SLACK_BOT_TOKEN,
   receiver,
 });
 
 // ===== Slash command: /cstask =====
-app.command("/cstask", async ({ ack, body, client }) => {
+app.command("/cstask", async ({ ack, body, client, logger }) => {
   await ack(); // must happen within ~3 seconds
 
   try {
@@ -165,20 +73,21 @@ app.command("/cstask", async ({ ack, body, client }) => {
       },
     });
   } catch (e) {
-    console.error(e);
+    logger.error(e);
+    // best-effort DM if modal open fails
     try {
       await client.chat.postMessage({
         channel: body.user_id,
         text: "❌ I couldn’t open the task form. Please try again or contact an admin.",
       });
     } catch (err) {
-      console.error(err);
+      logger.error(err);
     }
   }
 });
 
 // ===== Modal submit handler =====
-app.view("cstask_modal_submit", async ({ ack, body, view, client }) => {
+app.view("cstask_modal_submit", async ({ ack, body, view, client, logger }) => {
   const taskName =
     view.state.values.task_name_block.task_name_input.value?.trim() || "";
   const description =
@@ -195,16 +104,23 @@ app.view("cstask_modal_submit", async ({ ack, body, view, client }) => {
     return;
   }
 
-  // ACK immediately so Slack UI doesn't timeout
   await ack();
 
-  // Look up owner's email from Slack (requires users:read.email scope + reinstall)
+  if (!ZAPIER_WEBHOOK_URL) {
+    await client.chat.postMessage({
+      channel: body.user.id,
+      text: "❌ ZAPIER_WEBHOOK_URL is missing. Add it in Render Environment Variables and redeploy.",
+    });
+    return;
+  }
+
+  // Look up owner's email from Slack (requires users:read.email + reinstall)
   let taskOwnerEmail = null;
   try {
     const userInfo = await client.users.info({ user: ownerSlackUserId });
     taskOwnerEmail = userInfo?.user?.profile?.email || null;
   } catch (e) {
-    console.error(e);
+    logger.error(e);
   }
 
   if (!taskOwnerEmail) {
@@ -212,7 +128,7 @@ app.view("cstask_modal_submit", async ({ ack, body, view, client }) => {
       channel: body.user.id,
       text:
         "⚠️ I couldn’t retrieve the selected owner’s email from Slack.\n" +
-        "An admin may need to grant SyllaBot the `users:read.email` permission and reinstall the app.",
+        "Make sure SyllaBot has the `users:read.email` scope and that you reinstalled the app.",
     });
     return;
   }
@@ -238,11 +154,11 @@ app.view("cstask_modal_submit", async ({ ack, body, view, client }) => {
       text: `✅ Task sent to Zapier!\n• *Task:* ${taskName}\n• *Owner email:* ${taskOwnerEmail}`,
     });
   } catch (e) {
-    console.error(e);
+    logger.error(e);
     await client.chat.postMessage({
       channel: body.user.id,
       text:
-        "❌ I couldn’t send that task to Zapier. Check your Zapier Catch Hook step is turned on and try again.",
+        "❌ I couldn’t send that task to Zapier. Check your Zapier Catch Hook is on and try again.",
     });
   }
 });
