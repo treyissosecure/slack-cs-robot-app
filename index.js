@@ -29,25 +29,28 @@ function toStaticOptions(labels) {
 }
 
 // ==============================
+// SIMPLE IN-MEMORY CACHE (stability upgrade)
+// ==============================
+const CACHE_MS = 60 * 1000; // 60 seconds
+const cache = {
+  boards: { at: 0, options: [] }, // only used when search is empty
+  groupsByBoard: new Map(), // boardId -> { at, options } (only when search is empty)
+};
+
+// ==============================
 // SLACK RECEIVER (split endpoints)
 // ==============================
 const receiver = new ExpressReceiver({
   signingSecret: process.env.SLACK_SIGNING_SECRET,
   endpoints: {
     commands: "/slack/commands",
-    actions: "/slack/interactions", // also used for options load URL
+    actions: "/slack/interactions", // also used as options load URL
   },
 });
 
-// 🔎 HARD LOGGING: log everything that hits the underlying Express app
+// Basic request logging (keep while debugging; you can remove later)
 receiver.app.use((req, res, next) => {
-  console.log(
-    "[REQ]",
-    req.method,
-    req.originalUrl,
-    "CT:",
-    req.headers["content-type"]
-  );
+  console.log("[REQ]", req.method, req.originalUrl, "CT:", req.headers["content-type"]);
   next();
 });
 
@@ -60,6 +63,7 @@ receiver.app.get("/", (req, res) => res.status(200).send("OK"));
 const app = new App({
   token: process.env.SLACK_BOT_TOKEN,
   receiver,
+  // You can change to LogLevel.INFO later
   logLevel: LogLevel.DEBUG,
 });
 
@@ -89,6 +93,14 @@ async function mondayGraphQL(query, variables = {}) {
 }
 
 async function fetchBoards(search = "") {
+  const now = Date.now();
+  const s = (search || "").trim().toLowerCase();
+
+  // Cache only for empty search (when dropdown first opens)
+  if (!s && cache.boards.options.length && now - cache.boards.at < CACHE_MS) {
+    return cache.boards.options;
+  }
+
   const data = await mondayGraphQL(
     `
     query ($limit:Int!) {
@@ -99,19 +111,33 @@ async function fetchBoards(search = "") {
   );
 
   const boards = data?.boards || [];
-  const s = (search || "").toLowerCase();
 
-  return boards
+  const options = boards
     .filter((b) => !s || (b.name || "").toLowerCase().includes(s))
     .slice(0, 100)
     .map((b) => ({
       text: { type: "plain_text", text: b.name },
       value: String(b.id),
     }));
+
+  if (!s) {
+    cache.boards = { at: now, options };
+  }
+
+  return options;
 }
 
 async function fetchGroups(boardId, search = "") {
-  if (!boardId) return [];
+  const now = Date.now();
+  const s = (search || "").trim().toLowerCase();
+
+  // Cache only for empty search (when dropdown first opens)
+  if (!s) {
+    const cached = cache.groupsByBoard.get(boardId);
+    if (cached && cached.options?.length && now - cached.at < CACHE_MS) {
+      return cached.options;
+    }
+  }
 
   const data = await mondayGraphQL(
     `
@@ -126,57 +152,77 @@ async function fetchGroups(boardId, search = "") {
   );
 
   const groups = data?.boards?.[0]?.groups || [];
-  const s = (search || "").toLowerCase();
 
-  return groups
+  const options = groups
     .filter((g) => !s || (g.title || "").toLowerCase().includes(s))
     .slice(0, 100)
     .map((g) => ({
       text: { type: "plain_text", text: g.title },
       value: String(g.id),
     }));
+
+  if (!s) {
+    cache.groupsByBoard.set(boardId, { at: now, options });
+  }
+
+  return options;
 }
 
 // ==============================
-// DYNAMIC DROPDOWNS (Slack external_select options)
+// HELPERS: metadata
+// ==============================
+function parsePrivateMetadata(md) {
+  try {
+    return JSON.parse(md || "{}");
+  } catch {
+    return {};
+  }
+}
+
+function buildCleanViewPayload(view, privateMetadataString) {
+  // Slack views.update expects a "view payload" schema (not Slack's returned view object)
+  return {
+    type: "modal",
+    callback_id: view.callback_id,
+    title: view.title,
+    submit: view.submit,
+    close: view.close,
+    blocks: view.blocks,
+    private_metadata: privateMetadataString ?? view.private_metadata ?? "",
+    clear_on_close: view.clear_on_close,
+    notify_on_close: view.notify_on_close,
+  };
+}
+
+// ==============================
+// DYNAMIC DROPDOWNS (external_select options)
 // ==============================
 
+// Board dropdown options
 app.options("board_select", async ({ options, ack, logger }) => {
-  console.log("[OPTIONS] board_select fired; search:", options?.value);
-
+  // For options, ack() IS the response; must be fast.
   try {
-    if (!MONDAY_API_TOKEN) {
-      return await ack({
-        options: [
-          {
-            text: { type: "plain_text", text: "ERROR: MONDAY_API_TOKEN missing in Render" },
-            value: "ERROR_NO_MONDAY_TOKEN",
-          },
-        ],
-      });
-    }
-
-    const boardOptions = await fetchBoards(options?.value || "");
+    const search = options?.value || "";
+    const boardOptions = await fetchBoards(search);
 
     if (!boardOptions.length) {
       return await ack({
         options: [
           {
-            text: { type: "plain_text", text: "No boards found (token perms?)" },
+            text: { type: "plain_text", text: "No boards found" },
             value: "NO_BOARDS_FOUND",
           },
         ],
       });
     }
 
-    console.log("[OPTIONS] Returning boards:", boardOptions.length);
     await ack({ options: boardOptions });
   } catch (e) {
     logger.error(e);
     await ack({
       options: [
         {
-          text: { type: "plain_text", text: "ERROR loading boards (see Render logs)" },
+          text: { type: "plain_text", text: "ERROR loading boards (check Render logs)" },
           value: "ERROR_LOADING_BOARDS",
         },
       ],
@@ -184,37 +230,28 @@ app.options("board_select", async ({ options, ack, logger }) => {
   }
 });
 
-// ✅ When a board is selected, store it in private_metadata (correct views.update payload)
+// ✅ When a board is selected, store it in private_metadata (ack FIRST)
 app.action("board_select", async ({ ack, body, client, logger }) => {
-  await ack();
+  await ack(); // MUST be within 3 seconds
 
   try {
     const selectedBoardId = body?.actions?.[0]?.selected_option?.value || "";
     const view = body?.view;
 
-    if (!view?.id || !selectedBoardId) return;
+    if (!selectedBoardId || !view?.id) return;
 
-    // Parse existing metadata
-    let meta = {};
-    try {
-      meta = JSON.parse(view.private_metadata || "{}");
-    } catch {
-      meta = {};
-    }
+    const meta = parsePrivateMetadata(view.private_metadata);
     meta.boardId = selectedBoardId;
 
-    // IMPORTANT: views.update requires a "view payload" (no id/team_id/state/hash/etc)
-    const cleanView = {
-      type: "modal",
-      callback_id: view.callback_id,
-      title: view.title,
-      submit: view.submit,
-      close: view.close,
-      blocks: view.blocks,
-      private_metadata: JSON.stringify(meta),
-      clear_on_close: view.clear_on_close,
-      notify_on_close: view.notify_on_close,
-    };
+    // Optional: when board changes, you might want to clear the selected group.
+    // Slack will show whatever the user previously selected otherwise.
+    // We can clear it by rebuilding blocks and setting initial_option to null, but Slack doesn't
+    // support "unset selected_option" directly on external_select. So we just rely on re-opening group.
+
+    // Also: clear cached groups for this board? Not needed; cache is per-board and short.
+    // But you CAN clear any "previous board" groups if you want.
+
+    const cleanView = buildCleanViewPayload(view, JSON.stringify(meta));
 
     await client.views.update({
       view_id: view.id,
@@ -229,10 +266,160 @@ app.action("board_select", async ({ ack, body, client, logger }) => {
   }
 });
 
+// Group dropdown options (reads boardId from private_metadata)
+app.options("group_select", async ({ body, options, ack, logger }) => {
+  try {
+    const meta = parsePrivateMetadata(body?.view?.private_metadata);
+    const boardId = meta.boardId || "";
+    const search = options?.value || "";
+
+    if (!boardId) {
+      return await ack({
+        options: [
+          {
+            text: { type: "plain_text", text: "Select a board first" },
+            value: "SELECT_BOARD_FIRST",
+          },
+        ],
+      });
+    }
+
+    const groupOptions = await fetchGroups(boardId, search);
+
+    if (!groupOptions.length) {
+      return await ack({
+        options: [
+          {
+            text: { type: "plain_text", text: "No groups found for this board" },
+            value: "NO_GROUPS_FOUND",
+          },
+        ],
+      });
+    }
+
+    await ack({ options: groupOptions });
+  } catch (e) {
+    logger.error(e);
+    await ack({
+      options: [
+        {
+          text: { type: "plain_text", text: "ERROR loading groups (check Render logs)" },
+          value: "ERROR_LOADING_GROUPS",
+        },
+      ],
+    });
+  }
+});
+
+// ==============================
+// /cstask SLASH COMMAND -> OPEN MODAL
+// ==============================
+app.command("/cstask", async ({ ack, body, client, logger }) => {
+  await ack(); // Must ack quickly
+
+  try {
+    await client.views.open({
+      trigger_id: body.trigger_id,
+      view: {
+        type: "modal",
+        callback_id: "cstask_modal_submit",
+        title: { type: "plain_text", text: "Create CS Task" },
+        submit: { type: "plain_text", text: "Create" },
+        close: { type: "plain_text", text: "Cancel" },
+        private_metadata: JSON.stringify({}), // we’ll store boardId here
+        blocks: [
+          {
+            type: "input",
+            block_id: "task_name_block",
+            label: { type: "plain_text", text: "Task Name" },
+            element: { type: "plain_text_input", action_id: "task_name_input" },
+          },
+          {
+            type: "input",
+            block_id: "description_block",
+            optional: true,
+            label: { type: "plain_text", text: "Description" },
+            element: {
+              type: "plain_text_input",
+              action_id: "description_input",
+              multiline: true,
+            },
+          },
+          {
+            type: "input",
+            block_id: "owner_block",
+            label: { type: "plain_text", text: "Task Owner" },
+            element: { type: "users_select", action_id: "owner_user_select" },
+          },
+
+          // ✅ Dynamic Board (dispatch_action required so app.action("board_select") fires reliably)
+          {
+            type: "input",
+            block_id: "board_block",
+            dispatch_action: true,
+            label: { type: "plain_text", text: "Monday Board" },
+            element: {
+              type: "external_select",
+              action_id: "board_select",
+              placeholder: { type: "plain_text", text: "Search/select a board" },
+              min_query_length: 0,
+            },
+          },
+
+          // ✅ Dynamic Group (reads selected board from private_metadata)
+          {
+            type: "input",
+            block_id: "group_block",
+            label: { type: "plain_text", text: "Monday Group" },
+            element: {
+              type: "external_select",
+              action_id: "group_select",
+              placeholder: { type: "plain_text", text: "Search/select a group" },
+              min_query_length: 0,
+            },
+          },
+
+          {
+            type: "input",
+            block_id: "status_block",
+            label: { type: "plain_text", text: "Status" },
+            element: {
+              type: "static_select",
+              action_id: "status_select",
+              placeholder: { type: "plain_text", text: "Select a status" },
+              options: toStaticOptions(STATUS_LABELS),
+            },
+          },
+          {
+            type: "input",
+            block_id: "priority_block",
+            label: { type: "plain_text", text: "Priority" },
+            element: {
+              type: "static_select",
+              action_id: "priority_select",
+              placeholder: { type: "plain_text", text: "Select a priority" },
+              options: toStaticOptions(PRIORITY_LABELS),
+            },
+          },
+        ],
+      },
+    });
+  } catch (e) {
+    logger.error(e);
+    try {
+      await client.chat.postMessage({
+        channel: body.user_id,
+        text: "❌ I couldn’t open the task form. Please try again or contact an admin.",
+      });
+    } catch (_) {}
+  }
+});
+
 // ==============================
 // MODAL SUBMIT -> SEND TO ZAPIER
 // ==============================
 app.view("cstask_modal_submit", async ({ ack, body, view, client, logger }) => {
+  // Validate quickly and ack appropriately
   const taskName =
     view.state.values.task_name_block.task_name_input.value?.trim() || "";
   const description =
@@ -241,15 +428,8 @@ app.view("cstask_modal_submit", async ({ ack, body, view, client, logger }) => {
   const ownerSlackUserId =
     view.state.values.owner_block.owner_user_select.selected_user || "";
 
-  // ✅ Read boardId from private_metadata (reliable)
-  const boardId = (() => {
-    try {
-      const meta = JSON.parse(view.private_metadata || "{}");
-      return meta.boardId || "";
-    } catch {
-      return "";
-    }
-  })();
+  const meta = parsePrivateMetadata(view.private_metadata);
+  const boardId = meta.boardId || "";
 
   const groupId =
     view.state.values.group_block.group_select.selected_option?.value || "";
@@ -260,7 +440,6 @@ app.view("cstask_modal_submit", async ({ ack, body, view, client, logger }) => {
   const priorityLabel =
     view.state.values.priority_block.priority_select.selected_option?.value || "";
 
-  // Inline validation
   const errors = {};
   if (!taskName) errors["task_name_block"] = "Task name is required.";
   if (!ownerSlackUserId) errors["owner_block"] = "Please select an owner.";
@@ -274,9 +453,9 @@ app.view("cstask_modal_submit", async ({ ack, body, view, client, logger }) => {
     return;
   }
 
-  await ack();
+  await ack(); // ack before doing slow network work
 
-  // Owner email lookup (requires Slack scopes users:read + users:read.email and reinstall)
+  // Owner email lookup (requires users:read + users:read.email + reinstall)
   let taskOwnerEmail = null;
   try {
     const userInfo = await client.users.info({ user: ownerSlackUserId });
@@ -295,6 +474,14 @@ app.view("cstask_modal_submit", async ({ ack, body, view, client, logger }) => {
     return;
   }
 
+  if (!ZAPIER_WEBHOOK_URL) {
+    await client.chat.postMessage({
+      channel: body.user.id,
+      text: "❌ ZAPIER_WEBHOOK_URL is missing. Add it in Render env vars and redeploy.",
+    });
+    return;
+  }
+
   // Send to Zapier
   try {
     await axios.post(
@@ -302,7 +489,7 @@ app.view("cstask_modal_submit", async ({ ack, body, view, client, logger }) => {
       {
         source: "slack",
         command_name: "cstask",
-        version: "v3.1",
+        version: "v3.2",
         task_name: taskName,
         description,
         task_owner_slack_user_id: ownerSlackUserId,
@@ -342,5 +529,5 @@ app.view("cstask_modal_submit", async ({ ack, body, view, client, logger }) => {
 // ==============================
 (async () => {
   await app.start(process.env.PORT || 3000);
-  console.log("⚡️ SyllaBot is running (board->group fixed via private_metadata)");
+  console.log("⚡️ SyllaBot is running (stable dropdowns + board→group fix)");
 })();
