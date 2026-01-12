@@ -18,7 +18,9 @@ const STATUS_LABELS = [
 ];
 const PRIORITY_LABELS = ["Low", "Medium", "High"];
 
-// ===== Receiver with split endpoints =====
+const { App, ExpressReceiver, LogLevel } = require("@slack/bolt");
+
+// ===== Receiver with explicit logging =====
 const receiver = new ExpressReceiver({
   signingSecret: process.env.SLACK_SIGNING_SECRET,
   endpoints: {
@@ -27,18 +29,140 @@ const receiver = new ExpressReceiver({
   },
 });
 
-// ===== Bolt App =====
+// 🔎 LOG EVERY REQUEST hitting the Slack endpoints
+receiver.router.use((req, res, next) => {
+  console.log(
+    "[HTTP]",
+    req.method,
+    req.originalUrl,
+    "CT:",
+    req.headers["content-type"]
+  );
+  next();
+});
+
+// ===== Bolt App (DEBUG MODE) =====
 const app = new App({
   token: process.env.SLACK_BOT_TOKEN,
   receiver,
+  logLevel: LogLevel.DEBUG,
 });
 
-function toStaticOptions(labels) {
-  return labels.map((label) => ({
-    text: { type: "plain_text", text: label },
-    value: label,
-  }));
-}
+// ===== DEBUG: Board dropdown options =====
+app.options("board_select", async ({ options, ack, logger }) => {
+  console.log("[OPTIONS] board_select fired");
+  console.log("[OPTIONS] search value:", options?.value);
+
+  try {
+    if (!process.env.MONDAY_API_TOKEN) {
+      console.error("[OPTIONS] MONDAY_API_TOKEN is missing");
+      return await ack({
+        options: [
+          {
+            text: {
+              type: "plain_text",
+              text: "ERROR: MONDAY_API_TOKEN missing in Render",
+            },
+            value: "ERROR_NO_TOKEN",
+          },
+        ],
+      });
+    }
+
+    const boards = await fetchBoards(options?.value || "");
+
+    if (!boards.length) {
+      console.warn("[OPTIONS] No boards returned from Monday");
+      return await ack({
+        options: [
+          {
+            text: {
+              type: "plain_text",
+              text: "No boards found (check Monday permissions)",
+            },
+            value: "NO_BOARDS_FOUND",
+          },
+        ],
+      });
+    }
+
+    console.log("[OPTIONS] Returning boards:", boards.length);
+    await ack({ options: boards });
+  } catch (err) {
+    console.error("[OPTIONS] board_select ERROR:", err.message);
+    await ack({
+      options: [
+        {
+          text: {
+            type: "plain_text",
+            text: "ERROR loading boards (see Render logs)",
+          },
+          value: "ERROR_BOARDS",
+        },
+      ],
+    });
+  }
+});
+
+// ===== DEBUG: Group dropdown options =====
+app.options("group_select", async ({ body, options, ack, logger }) => {
+  const boardId =
+    body?.view?.state?.values?.board_block?.board_select?.selected_option
+      ?.value || "";
+
+  console.log("[OPTIONS] group_select fired");
+  console.log("[OPTIONS] boardId:", boardId);
+  console.log("[OPTIONS] search value:", options?.value);
+
+  try {
+    if (!boardId || boardId.startsWith("ERROR") || boardId.startsWith("NO_")) {
+      return await ack({
+        options: [
+          {
+            text: {
+              type: "plain_text",
+              text: "Select a valid board first",
+            },
+            value: "SELECT_BOARD_FIRST",
+          },
+        ],
+      });
+    }
+
+    const groups = await fetchGroups(boardId, options?.value || "");
+
+    if (!groups.length) {
+      console.warn("[OPTIONS] No groups returned for board:", boardId);
+      return await ack({
+        options: [
+          {
+            text: {
+              type: "plain_text",
+              text: "No groups found for this board",
+            },
+            value: "NO_GROUPS_FOUND",
+          },
+        ],
+      });
+    }
+
+    console.log("[OPTIONS] Returning groups:", groups.length);
+    await ack({ options: groups });
+  } catch (err) {
+    console.error("[OPTIONS] group_select ERROR:", err.message);
+    await ack({
+      options: [
+        {
+          text: {
+            type: "plain_text",
+            text: "ERROR loading groups (see Render logs)",
+          },
+          value: "ERROR_GROUPS",
+        },
+      ],
+    });
+  }
+});
 
 // ===== Monday API helpers =====
 async function mondayGraphQL(query, variables = {}) {
