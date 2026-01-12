@@ -6,6 +6,8 @@ const ZAPIER_WEBHOOK_URL =
   process.env.ZAPIER_WEBHOOK_URL ||
   "https://hooks.zapier.com/hooks/catch/25767132/ug29zll/";
 
+const MONDAY_API_TOKEN = process.env.MONDAY_API_TOKEN;
+
 // Monday labels (must match exactly)
 const STATUS_LABELS = [
   "Not Started",
@@ -14,7 +16,6 @@ const STATUS_LABELS = [
   "Pending Review",
   "Done",
 ];
-
 const PRIORITY_LABELS = ["Low", "Medium", "High"];
 
 // ===== Receiver with split endpoints =====
@@ -35,9 +36,94 @@ const app = new App({
 function toStaticOptions(labels) {
   return labels.map((label) => ({
     text: { type: "plain_text", text: label },
-    value: label, // send label itself to Zapier
+    value: label,
   }));
 }
+
+// ===== Monday API helpers =====
+async function mondayGraphQL(query, variables = {}) {
+  if (!MONDAY_API_TOKEN) throw new Error("Missing MONDAY_API_TOKEN");
+  const res = await axios.post(
+    "https://api.monday.com/v2",
+    { query, variables },
+    { headers: { Authorization: MONDAY_API_TOKEN, "Content-Type": "application/json" }, timeout: 10000 }
+  );
+  if (res.data?.errors?.length) {
+    throw new Error(`Monday API error: ${JSON.stringify(res.data.errors)}`);
+  }
+  return res.data.data;
+}
+
+async function fetchBoards(search = "") {
+  // Fetch boards (limit 100). If you have tons of boards, we can improve this later.
+  const data = await mondayGraphQL(`
+    query ($limit:Int!) {
+      boards(limit: $limit) { id name }
+    }
+  `, { limit: 100 });
+
+  const boards = data?.boards || [];
+  const s = (search || "").toLowerCase();
+  return boards
+    .filter(b => !s || b.name.toLowerCase().includes(s))
+    .slice(0, 100)
+    .map(b => ({
+      text: { type: "plain_text", text: b.name },
+      value: String(b.id),
+    }));
+}
+
+async function fetchGroups(boardId, search = "") {
+  if (!boardId) return [];
+  const data = await mondayGraphQL(`
+    query ($ids:[ID!]!) {
+      boards(ids: $ids) {
+        id
+        groups { id title }
+      }
+    }
+  `, { ids: [boardId] });
+
+  const groups = data?.boards?.[0]?.groups || [];
+  const s = (search || "").toLowerCase();
+  return groups
+    .filter(g => !s || g.title.toLowerCase().includes(s))
+    .slice(0, 100)
+    .map(g => ({
+      text: { type: "plain_text", text: g.title },
+      value: String(g.id),
+    }));
+}
+
+// ===== Dynamic options handlers =====
+// Slack calls these when user opens/types in an external_select.  [oai_citation:1‡Slack Developer Docs](https://docs.slack.dev/reference/interaction-payloads/block_suggestion-payload/?utm_source=chatgpt.com)
+
+app.options("board_select", async ({ options, ack, logger }) => {
+  try {
+    const search = options?.value || "";
+    const boardOptions = await fetchBoards(search);
+    await ack({ options: boardOptions });
+  } catch (e) {
+    logger.error(e);
+    await ack({ options: [] });
+  }
+});
+
+app.options("group_select", async ({ body, options, ack, logger }) => {
+  try {
+    const search = options?.value || "";
+
+    // Try to read the selected board from the modal state
+    const boardId =
+      body?.view?.state?.values?.board_block?.board_select?.selected_option?.value || "";
+
+    const groupOptions = await fetchGroups(boardId, search);
+    await ack({ options: groupOptions });
+  } catch (e) {
+    logger.error(e);
+    await ack({ options: [] });
+  }
+});
 
 // ===== Slash command: /cstask =====
 app.command("/cstask", async ({ ack, body, client, logger }) => {
@@ -85,6 +171,33 @@ app.command("/cstask", async ({ ack, body, client, logger }) => {
               placeholder: { type: "plain_text", text: "Select a Slack user" },
             },
           },
+
+          // ✅ Dynamic Board
+          {
+            type: "input",
+            block_id: "board_block",
+            label: { type: "plain_text", text: "Monday Board" },
+            element: {
+              type: "external_select",
+              action_id: "board_select",
+              placeholder: { type: "plain_text", text: "Search/select a board" },
+              min_query_length: 0
+            },
+          },
+
+          // ✅ Dynamic Group (depends on board selection)
+          {
+            type: "input",
+            block_id: "group_block",
+            label: { type: "plain_text", text: "Monday Group" },
+            element: {
+              type: "external_select",
+              action_id: "group_select",
+              placeholder: { type: "plain_text", text: "Search/select a group" },
+              min_query_length: 0
+            },
+          },
+
           {
             type: "input",
             block_id: "status_block",
@@ -133,6 +246,12 @@ app.view("cstask_modal_submit", async ({ ack, body, view, client, logger }) => {
   const ownerSlackUserId =
     view.state.values.owner_block.owner_user_select.selected_user || "";
 
+  const boardId =
+    view.state.values.board_block.board_select.selected_option?.value || "";
+
+  const groupId =
+    view.state.values.group_block.group_select.selected_option?.value || "";
+
   const statusLabel =
     view.state.values.status_block.status_select.selected_option?.value || "";
 
@@ -143,6 +262,8 @@ app.view("cstask_modal_submit", async ({ ack, body, view, client, logger }) => {
   const errors = {};
   if (!taskName) errors["task_name_block"] = "Task name is required.";
   if (!ownerSlackUserId) errors["owner_block"] = "Please select an owner.";
+  if (!boardId) errors["board_block"] = "Please select a board.";
+  if (!groupId) errors["group_block"] = "Please select a group.";
   if (!statusLabel) errors["status_block"] = "Please select a status.";
   if (!priorityLabel) errors["priority_block"] = "Please select a priority.";
 
@@ -172,18 +293,20 @@ app.view("cstask_modal_submit", async ({ ack, body, view, client, logger }) => {
     return;
   }
 
-  // Send to Zapier (includes status + priority)
+  // Send to Zapier (now includes board_id + group_id)
   try {
     await axios.post(
       ZAPIER_WEBHOOK_URL,
       {
         source: "slack",
         command_name: "cstask",
-        version: "v2",
+        version: "v3",
         task_name: taskName,
         description,
         task_owner_slack_user_id: ownerSlackUserId,
         task_owner_email: taskOwnerEmail,
+        monday_board_id: boardId,
+        monday_group_id: groupId,
         status_label: statusLabel,
         priority_label: priorityLabel,
         submitted_by_slack_user_id: body.user.id,
@@ -197,6 +320,8 @@ app.view("cstask_modal_submit", async ({ ack, body, view, client, logger }) => {
       text:
         `✅ Task sent to Zapier!\n` +
         `• *Task:* ${taskName}\n` +
+        `• *Board ID:* ${boardId}\n` +
+        `• *Group ID:* ${groupId}\n` +
         `• *Status:* ${statusLabel}\n` +
         `• *Priority:* ${priorityLabel}\n` +
         `• *Owner:* ${taskOwnerEmail}`,
@@ -214,5 +339,5 @@ app.view("cstask_modal_submit", async ({ ack, body, view, client, logger }) => {
 // ===== Start server =====
 (async () => {
   await app.start(process.env.PORT || 3000);
-  console.log("⚡️ SyllaBot is running (cstask v2)");
+  console.log("⚡️ SyllaBot is running (cstask v3: dynamic board/group)");
 })();
