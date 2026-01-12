@@ -1,7 +1,9 @@
-const { App, ExpressReceiver } = require("@slack/bolt");
+const { App, ExpressReceiver, LogLevel } = require("@slack/bolt");
 const axios = require("axios");
 
-// ===== CONFIG =====
+// ==============================
+// CONFIG
+// ==============================
 const ZAPIER_WEBHOOK_URL =
   process.env.ZAPIER_WEBHOOK_URL ||
   "https://hooks.zapier.com/hooks/catch/25767132/ug29zll/";
@@ -16,11 +18,19 @@ const STATUS_LABELS = [
   "Pending Review",
   "Done",
 ];
+
 const PRIORITY_LABELS = ["Low", "Medium", "High"];
 
-const { App, ExpressReceiver, LogLevel } = require("@slack/bolt");
+function toStaticOptions(labels) {
+  return labels.map((label) => ({
+    text: { type: "plain_text", text: label },
+    value: label,
+  }));
+}
 
-// ===== Receiver with explicit logging =====
+// ==============================
+// SLACK RECEIVER (split endpoints)
+// ==============================
 const receiver = new ExpressReceiver({
   signingSecret: process.env.SLACK_SIGNING_SECRET,
   endpoints: {
@@ -29,7 +39,7 @@ const receiver = new ExpressReceiver({
   },
 });
 
-// 🔎 LOG EVERY REQUEST hitting the Slack endpoints
+// Log every incoming request to Slack endpoints (very useful for debugging)
 receiver.router.use((req, res, next) => {
   console.log(
     "[HTTP]",
@@ -41,157 +51,63 @@ receiver.router.use((req, res, next) => {
   next();
 });
 
-// ===== Bolt App (DEBUG MODE) =====
+// Simple health check so you can hit https://<render>/ and see OK
+receiver.router.get("/", (req, res) => res.status(200).send("OK"));
+
+// ==============================
+// BOLT APP
+// ==============================
 const app = new App({
   token: process.env.SLACK_BOT_TOKEN,
   receiver,
   logLevel: LogLevel.DEBUG,
 });
 
-// ===== DEBUG: Board dropdown options =====
-app.options("board_select", async ({ options, ack, logger }) => {
-  console.log("[OPTIONS] board_select fired");
-  console.log("[OPTIONS] search value:", options?.value);
-
-  try {
-    if (!process.env.MONDAY_API_TOKEN) {
-      console.error("[OPTIONS] MONDAY_API_TOKEN is missing");
-      return await ack({
-        options: [
-          {
-            text: {
-              type: "plain_text",
-              text: "ERROR: MONDAY_API_TOKEN missing in Render",
-            },
-            value: "ERROR_NO_TOKEN",
-          },
-        ],
-      });
-    }
-
-    const boards = await fetchBoards(options?.value || "");
-
-    if (!boards.length) {
-      console.warn("[OPTIONS] No boards returned from Monday");
-      return await ack({
-        options: [
-          {
-            text: {
-              type: "plain_text",
-              text: "No boards found (check Monday permissions)",
-            },
-            value: "NO_BOARDS_FOUND",
-          },
-        ],
-      });
-    }
-
-    console.log("[OPTIONS] Returning boards:", boards.length);
-    await ack({ options: boards });
-  } catch (err) {
-    console.error("[OPTIONS] board_select ERROR:", err.message);
-    await ack({
-      options: [
-        {
-          text: {
-            type: "plain_text",
-            text: "ERROR loading boards (see Render logs)",
-          },
-          value: "ERROR_BOARDS",
-        },
-      ],
-    });
-  }
-});
-
-// ===== DEBUG: Group dropdown options =====
-app.options("group_select", async ({ body, options, ack, logger }) => {
-  const boardId =
-    body?.view?.state?.values?.board_block?.board_select?.selected_option
-      ?.value || "";
-
-  console.log("[OPTIONS] group_select fired");
-  console.log("[OPTIONS] boardId:", boardId);
-  console.log("[OPTIONS] search value:", options?.value);
-
-  try {
-    if (!boardId || boardId.startsWith("ERROR") || boardId.startsWith("NO_")) {
-      return await ack({
-        options: [
-          {
-            text: {
-              type: "plain_text",
-              text: "Select a valid board first",
-            },
-            value: "SELECT_BOARD_FIRST",
-          },
-        ],
-      });
-    }
-
-    const groups = await fetchGroups(boardId, options?.value || "");
-
-    if (!groups.length) {
-      console.warn("[OPTIONS] No groups returned for board:", boardId);
-      return await ack({
-        options: [
-          {
-            text: {
-              type: "plain_text",
-              text: "No groups found for this board",
-            },
-            value: "NO_GROUPS_FOUND",
-          },
-        ],
-      });
-    }
-
-    console.log("[OPTIONS] Returning groups:", groups.length);
-    await ack({ options: groups });
-  } catch (err) {
-    console.error("[OPTIONS] group_select ERROR:", err.message);
-    await ack({
-      options: [
-        {
-          text: {
-            type: "plain_text",
-            text: "ERROR loading groups (see Render logs)",
-          },
-          value: "ERROR_GROUPS",
-        },
-      ],
-    });
-  }
-});
-
-// ===== Monday API helpers =====
+// ==============================
+// MONDAY API HELPERS
+// ==============================
 async function mondayGraphQL(query, variables = {}) {
-  if (!MONDAY_API_TOKEN) throw new Error("Missing MONDAY_API_TOKEN");
+  if (!MONDAY_API_TOKEN) {
+    throw new Error("Missing MONDAY_API_TOKEN");
+  }
+
   const res = await axios.post(
     "https://api.monday.com/v2",
     { query, variables },
-    { headers: { Authorization: MONDAY_API_TOKEN, "Content-Type": "application/json" }, timeout: 10000 }
+    {
+      headers: {
+        Authorization: MONDAY_API_TOKEN,
+        "Content-Type": "application/json",
+      },
+      timeout: 10000,
+    }
   );
+
   if (res.data?.errors?.length) {
     throw new Error(`Monday API error: ${JSON.stringify(res.data.errors)}`);
   }
+
   return res.data.data;
 }
 
 async function fetchBoards(search = "") {
-  // Fetch boards (limit 100). If you have tons of boards, we can improve this later.
-  const data = await mondayGraphQL(`
+  // NOTE: boards(limit:100) returns up to 100 boards. If you have more, we can paginate later.
+  const data = await mondayGraphQL(
+    `
     query ($limit:Int!) {
       boards(limit: $limit) { id name }
     }
-  `, { limit: 100 });
+  `,
+    { limit: 100 }
+  );
 
   const boards = data?.boards || [];
   const s = (search || "").toLowerCase();
+
   return boards
-    .filter(b => !s || b.name.toLowerCase().includes(s))
+    .filter((b) => !s || (b.name || "").toLowerCase().includes(s))
     .slice(0, 100)
-    .map(b => ({
+    .map((b) => ({
       text: { type: "plain_text", text: b.name },
       value: String(b.id),
     }));
@@ -199,57 +115,134 @@ async function fetchBoards(search = "") {
 
 async function fetchGroups(boardId, search = "") {
   if (!boardId) return [];
-  const data = await mondayGraphQL(`
+
+  const data = await mondayGraphQL(
+    `
     query ($ids:[ID!]!) {
       boards(ids: $ids) {
         id
         groups { id title }
       }
     }
-  `, { ids: [boardId] });
+  `,
+    { ids: [boardId] }
+  );
 
   const groups = data?.boards?.[0]?.groups || [];
   const s = (search || "").toLowerCase();
+
   return groups
-    .filter(g => !s || g.title.toLowerCase().includes(s))
+    .filter((g) => !s || (g.title || "").toLowerCase().includes(s))
     .slice(0, 100)
-    .map(g => ({
+    .map((g) => ({
       text: { type: "plain_text", text: g.title },
       value: String(g.id),
     }));
 }
 
-// ===== Dynamic options handlers =====
-// Slack calls these when user opens/types in an external_select.  [oai_citation:1‡Slack Developer Docs](https://docs.slack.dev/reference/interaction-payloads/block_suggestion-payload/?utm_source=chatgpt.com)
+// ==============================
+// DYNAMIC DROPDOWNS (Slack external_select options)
+// ==============================
 
+// Board dropdown options
 app.options("board_select", async ({ options, ack, logger }) => {
+  console.log("[OPTIONS] board_select fired; search:", options?.value);
+
   try {
-    const search = options?.value || "";
-    const boardOptions = await fetchBoards(search);
+    if (!MONDAY_API_TOKEN) {
+      console.error("[OPTIONS] MONDAY_API_TOKEN missing");
+      return await ack({
+        options: [
+          {
+            text: { type: "plain_text", text: "ERROR: MONDAY_API_TOKEN missing in Render" },
+            value: "ERROR_NO_MONDAY_TOKEN",
+          },
+        ],
+      });
+    }
+
+    const boardOptions = await fetchBoards(options?.value || "");
+
+    if (!boardOptions.length) {
+      console.warn("[OPTIONS] No boards returned from Monday");
+      return await ack({
+        options: [
+          {
+            text: { type: "plain_text", text: "No boards found (token perms?)" },
+            value: "NO_BOARDS_FOUND",
+          },
+        ],
+      });
+    }
+
+    console.log("[OPTIONS] Returning boards:", boardOptions.length);
     await ack({ options: boardOptions });
   } catch (e) {
     logger.error(e);
-    await ack({ options: [] });
+    console.error("[OPTIONS] board_select error:", e?.message || e);
+    await ack({
+      options: [
+        {
+          text: { type: "plain_text", text: "ERROR loading boards (see Render logs)" },
+          value: "ERROR_LOADING_BOARDS",
+        },
+      ],
+    });
   }
 });
 
+// Group dropdown options (depends on selected board)
 app.options("group_select", async ({ body, options, ack, logger }) => {
+  const boardId =
+    body?.view?.state?.values?.board_block?.board_select?.selected_option?.value || "";
+
+  console.log("[OPTIONS] group_select fired; boardId:", boardId, "; search:", options?.value);
+
   try {
-    const search = options?.value || "";
+    if (!boardId || boardId.startsWith("ERROR") || boardId.startsWith("NO_")) {
+      return await ack({
+        options: [
+          {
+            text: { type: "plain_text", text: "Select a valid board first" },
+            value: "SELECT_BOARD_FIRST",
+          },
+        ],
+      });
+    }
 
-    // Try to read the selected board from the modal state
-    const boardId =
-      body?.view?.state?.values?.board_block?.board_select?.selected_option?.value || "";
+    const groupOptions = await fetchGroups(boardId, options?.value || "");
 
-    const groupOptions = await fetchGroups(boardId, search);
+    if (!groupOptions.length) {
+      console.warn("[OPTIONS] No groups returned for board:", boardId);
+      return await ack({
+        options: [
+          {
+            text: { type: "plain_text", text: "No groups found for this board" },
+            value: "NO_GROUPS_FOUND",
+          },
+        ],
+      });
+    }
+
+    console.log("[OPTIONS] Returning groups:", groupOptions.length);
     await ack({ options: groupOptions });
   } catch (e) {
     logger.error(e);
-    await ack({ options: [] });
+    console.error("[OPTIONS] group_select error:", e?.message || e);
+    await ack({
+      options: [
+        {
+          text: { type: "plain_text", text: "ERROR loading groups (see Render logs)" },
+          value: "ERROR_LOADING_GROUPS",
+        },
+      ],
+    });
   }
 });
 
-// ===== Slash command: /cstask =====
+// ==============================
+// /cstask SLASH COMMAND -> OPEN MODAL
+// ==============================
 app.command("/cstask", async ({ ack, body, client, logger }) => {
   await ack();
 
@@ -267,36 +260,21 @@ app.command("/cstask", async ({ ack, body, client, logger }) => {
             type: "input",
             block_id: "task_name_block",
             label: { type: "plain_text", text: "Task Name" },
-            element: {
-              type: "plain_text_input",
-              action_id: "task_name_input",
-              placeholder: { type: "plain_text", text: "e.g., Follow up with Acme" },
-            },
+            element: { type: "plain_text_input", action_id: "task_name_input" },
           },
           {
             type: "input",
             block_id: "description_block",
             optional: true,
             label: { type: "plain_text", text: "Description" },
-            element: {
-              type: "plain_text_input",
-              action_id: "description_input",
-              multiline: true,
-              placeholder: { type: "plain_text", text: "Context, links, next steps..." },
-            },
+            element: { type: "plain_text_input", action_id: "description_input", multiline: true },
           },
           {
             type: "input",
             block_id: "owner_block",
             label: { type: "plain_text", text: "Task Owner" },
-            element: {
-              type: "users_select",
-              action_id: "owner_user_select",
-              placeholder: { type: "plain_text", text: "Select a Slack user" },
-            },
+            element: { type: "users_select", action_id: "owner_user_select" },
           },
-
-          // ✅ Dynamic Board
           {
             type: "input",
             block_id: "board_block",
@@ -305,11 +283,9 @@ app.command("/cstask", async ({ ack, body, client, logger }) => {
               type: "external_select",
               action_id: "board_select",
               placeholder: { type: "plain_text", text: "Search/select a board" },
-              min_query_length: 0
+              min_query_length: 0,
             },
           },
-
-          // ✅ Dynamic Group (depends on board selection)
           {
             type: "input",
             block_id: "group_block",
@@ -318,10 +294,9 @@ app.command("/cstask", async ({ ack, body, client, logger }) => {
               type: "external_select",
               action_id: "group_select",
               placeholder: { type: "plain_text", text: "Search/select a group" },
-              min_query_length: 0
+              min_query_length: 0,
             },
           },
-
           {
             type: "input",
             block_id: "status_block",
@@ -349,18 +324,16 @@ app.command("/cstask", async ({ ack, body, client, logger }) => {
     });
   } catch (e) {
     logger.error(e);
-    try {
-      await client.chat.postMessage({
-        channel: body.user_id,
-        text: "❌ I couldn’t open the task form. Please try again or contact an admin.",
-      });
-    } catch (err) {
-      logger.error(err);
-    }
+    await client.chat.postMessage({
+      channel: body.user_id,
+      text: "❌ I couldn’t open the task form. Please try again or contact an admin.",
+    });
   }
 });
 
-// ===== Modal submit handler =====
+// ==============================
+// MODAL SUBMIT -> SEND TO ZAPIER
+// ==============================
 app.view("cstask_modal_submit", async ({ ack, body, view, client, logger }) => {
   const taskName =
     view.state.values.task_name_block.task_name_input.value?.trim() || "";
@@ -386,8 +359,10 @@ app.view("cstask_modal_submit", async ({ ack, body, view, client, logger }) => {
   const errors = {};
   if (!taskName) errors["task_name_block"] = "Task name is required.";
   if (!ownerSlackUserId) errors["owner_block"] = "Please select an owner.";
-  if (!boardId) errors["board_block"] = "Please select a board.";
-  if (!groupId) errors["group_block"] = "Please select a group.";
+  if (!boardId || boardId.startsWith("ERROR") || boardId.startsWith("NO_"))
+    errors["board_block"] = "Please select a valid board.";
+  if (!groupId || groupId.startsWith("ERROR") || groupId.startsWith("NO_"))
+    errors["group_block"] = "Please select a valid group.";
   if (!statusLabel) errors["status_block"] = "Please select a status.";
   if (!priorityLabel) errors["priority_block"] = "Please select a priority.";
 
@@ -398,7 +373,7 @@ app.view("cstask_modal_submit", async ({ ack, body, view, client, logger }) => {
 
   await ack();
 
-  // Look up owner's email (requires users:read.email + reinstall)
+  // Owner email lookup (requires Slack scopes users:read + users:read.email and reinstall)
   let taskOwnerEmail = null;
   try {
     const userInfo = await client.users.info({ user: ownerSlackUserId });
@@ -412,12 +387,12 @@ app.view("cstask_modal_submit", async ({ ack, body, view, client, logger }) => {
       channel: body.user.id,
       text:
         "⚠️ I couldn’t retrieve the selected owner’s email from Slack.\n" +
-        "Make sure SyllaBot has the `users:read.email` scope and that you reinstalled the app.",
+        "Make sure SyllaBot has `users:read.email` and you reinstalled the app.",
     });
     return;
   }
 
-  // Send to Zapier (now includes board_id + group_id)
+  // Send to Zapier
   try {
     await axios.post(
       ZAPIER_WEBHOOK_URL,
@@ -454,14 +429,15 @@ app.view("cstask_modal_submit", async ({ ack, body, view, client, logger }) => {
     logger.error(e);
     await client.chat.postMessage({
       channel: body.user.id,
-      text:
-        "❌ I couldn’t send that task to Zapier. Check your Zapier Catch Hook is on and try again.",
+      text: "❌ I couldn’t send that task to Zapier. Check Zapier + Render logs and try again.",
     });
   }
 });
 
-// ===== Start server =====
+// ==============================
+// START SERVER
+// ==============================
 (async () => {
   await app.start(process.env.PORT || 3000);
-  console.log("⚡️ SyllaBot is running (cstask v3: dynamic board/group)");
+  console.log("⚡️ SyllaBot is running (dynamic board/group enabled)");
 })();
