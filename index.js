@@ -184,7 +184,7 @@ app.options("board_select", async ({ options, ack, logger }) => {
   }
 });
 
-// ✅ FIX: store board selection in private_metadata so group_select can reliably read it
+// ✅ When a board is selected, store it in private_metadata (correct views.update payload)
 app.action("board_select", async ({ ack, body, client, logger }) => {
   await ack();
 
@@ -194,182 +194,38 @@ app.action("board_select", async ({ ack, body, client, logger }) => {
 
     if (!view?.id || !selectedBoardId) return;
 
+    // Parse existing metadata
     let meta = {};
     try {
       meta = JSON.parse(view.private_metadata || "{}");
     } catch {
       meta = {};
     }
-
     meta.boardId = selectedBoardId;
+
+    // IMPORTANT: views.update requires a "view payload" (no id/team_id/state/hash/etc)
+    const cleanView = {
+      type: "modal",
+      callback_id: view.callback_id,
+      title: view.title,
+      submit: view.submit,
+      close: view.close,
+      blocks: view.blocks,
+      private_metadata: JSON.stringify(meta),
+      clear_on_close: view.clear_on_close,
+      notify_on_close: view.notify_on_close,
+    };
 
     await client.views.update({
       view_id: view.id,
       hash: view.hash,
-      view: {
-        ...view,
-        private_metadata: JSON.stringify(meta),
-      },
+      view: cleanView,
     });
 
     console.log("[ACTION] board_select stored boardId:", selectedBoardId);
   } catch (e) {
     logger.error(e);
-  }
-});
-
-app.options("group_select", async ({ body, options, ack, logger }) => {
-  // ✅ Read boardId from private_metadata (reliable)
-  const boardId = (() => {
-    try {
-      const meta = JSON.parse(body?.view?.private_metadata || "{}");
-      return meta.boardId || "";
-    } catch {
-      return "";
-    }
-  })();
-
-  console.log("[OPTIONS] group_select fired; boardId:", boardId, "; search:", options?.value);
-
-  try {
-    if (!boardId) {
-      return await ack({
-        options: [
-          {
-            text: { type: "plain_text", text: "Select a valid board first" },
-            value: "SELECT_BOARD_FIRST",
-          },
-        ],
-      });
-    }
-
-    const groupOptions = await fetchGroups(boardId, options?.value || "");
-
-    if (!groupOptions.length) {
-      return await ack({
-        options: [
-          {
-            text: { type: "plain_text", text: "No groups found for this board" },
-            value: "NO_GROUPS_FOUND",
-          },
-        ],
-      });
-    }
-
-    console.log("[OPTIONS] Returning groups:", groupOptions.length);
-    await ack({ options: groupOptions });
-  } catch (e) {
-    logger.error(e);
-    await ack({
-      options: [
-        {
-          text: { type: "plain_text", text: "ERROR loading groups (see Render logs)" },
-          value: "ERROR_LOADING_GROUPS",
-        },
-      ],
-    });
-  }
-});
-
-// ==============================
-// /cstask SLASH COMMAND -> OPEN MODAL
-// ==============================
-app.command("/cstask", async ({ ack, body, client, logger }) => {
-  await ack();
-
-  try {
-    await client.views.open({
-      trigger_id: body.trigger_id,
-      view: {
-        type: "modal",
-        callback_id: "cstask_modal_submit",
-        title: { type: "plain_text", text: "Create CS Task" },
-        submit: { type: "plain_text", text: "Create" },
-        close: { type: "plain_text", text: "Cancel" },
-        private_metadata: JSON.stringify({}), // will store boardId later
-        blocks: [
-          {
-            type: "input",
-            block_id: "task_name_block",
-            label: { type: "plain_text", text: "Task Name" },
-            element: { type: "plain_text_input", action_id: "task_name_input" },
-          },
-          {
-            type: "input",
-            block_id: "description_block",
-            optional: true,
-            label: { type: "plain_text", text: "Description" },
-            element: {
-              type: "plain_text_input",
-              action_id: "description_input",
-              multiline: true,
-            },
-          },
-          {
-            type: "input",
-            block_id: "owner_block",
-            label: { type: "plain_text", text: "Task Owner" },
-            element: { type: "users_select", action_id: "owner_user_select" },
-          },
-
-          // ✅ Dynamic Board (dispatch_action is required)
-          {
-            type: "input",
-            block_id: "board_block",
-            dispatch_action: true,
-            label: { type: "plain_text", text: "Monday Board" },
-            element: {
-              type: "external_select",
-              action_id: "board_select",
-              placeholder: { type: "plain_text", text: "Search/select a board" },
-              min_query_length: 0,
-            },
-          },
-
-          // ✅ Dynamic Group (depends on board stored in private_metadata)
-          {
-            type: "input",
-            block_id: "group_block",
-            label: { type: "plain_text", text: "Monday Group" },
-            element: {
-              type: "external_select",
-              action_id: "group_select",
-              placeholder: { type: "plain_text", text: "Search/select a group" },
-              min_query_length: 0,
-            },
-          },
-
-          {
-            type: "input",
-            block_id: "status_block",
-            label: { type: "plain_text", text: "Status" },
-            element: {
-              type: "static_select",
-              action_id: "status_select",
-              placeholder: { type: "plain_text", text: "Select a status" },
-              options: toStaticOptions(STATUS_LABELS),
-            },
-          },
-          {
-            type: "input",
-            block_id: "priority_block",
-            label: { type: "plain_text", text: "Priority" },
-            element: {
-              type: "static_select",
-              action_id: "priority_select",
-              placeholder: { type: "plain_text", text: "Select a priority" },
-              options: toStaticOptions(PRIORITY_LABELS),
-            },
-          },
-        ],
-      },
-    });
-  } catch (e) {
-    logger.error(e);
-    await client.chat.postMessage({
-      channel: body.user_id,
-      text: "❌ I couldn’t open the task form. Please try again or contact an admin.",
-    });
+    console.error("[ACTION] board_select error:", e?.message || e);
   }
 });
 
