@@ -35,14 +35,14 @@ const receiver = new ExpressReceiver({
   signingSecret: process.env.SLACK_SIGNING_SECRET,
   endpoints: {
     commands: "/slack/commands",
-    actions: "/slack/interactions",
+    actions: "/slack/interactions", // also used for options load URL
   },
 });
 
-// Log every incoming request to Slack endpoints (very useful for debugging)
-receiver.router.use((req, res, next) => {
+// 🔎 HARD LOGGING: log everything that hits the underlying Express app
+receiver.app.use((req, res, next) => {
   console.log(
-    "[HTTP]",
+    "[REQ]",
     req.method,
     req.originalUrl,
     "CT:",
@@ -51,8 +51,8 @@ receiver.router.use((req, res, next) => {
   next();
 });
 
-// Simple health check so you can hit https://<render>/ and see OK
-receiver.router.get("/", (req, res) => res.status(200).send("OK"));
+// Health check
+receiver.app.get("/", (req, res) => res.status(200).send("OK"));
 
 // ==============================
 // BOLT APP
@@ -67,9 +67,7 @@ const app = new App({
 // MONDAY API HELPERS
 // ==============================
 async function mondayGraphQL(query, variables = {}) {
-  if (!MONDAY_API_TOKEN) {
-    throw new Error("Missing MONDAY_API_TOKEN");
-  }
+  if (!MONDAY_API_TOKEN) throw new Error("Missing MONDAY_API_TOKEN");
 
   const res = await axios.post(
     "https://api.monday.com/v2",
@@ -91,7 +89,6 @@ async function mondayGraphQL(query, variables = {}) {
 }
 
 async function fetchBoards(search = "") {
-  // NOTE: boards(limit:100) returns up to 100 boards. If you have more, we can paginate later.
   const data = await mondayGraphQL(
     `
     query ($limit:Int!) {
@@ -144,13 +141,11 @@ async function fetchGroups(boardId, search = "") {
 // DYNAMIC DROPDOWNS (Slack external_select options)
 // ==============================
 
-// Board dropdown options
 app.options("board_select", async ({ options, ack, logger }) => {
   console.log("[OPTIONS] board_select fired; search:", options?.value);
 
   try {
     if (!MONDAY_API_TOKEN) {
-      console.error("[OPTIONS] MONDAY_API_TOKEN missing");
       return await ack({
         options: [
           {
@@ -164,7 +159,6 @@ app.options("board_select", async ({ options, ack, logger }) => {
     const boardOptions = await fetchBoards(options?.value || "");
 
     if (!boardOptions.length) {
-      console.warn("[OPTIONS] No boards returned from Monday");
       return await ack({
         options: [
           {
@@ -179,7 +173,6 @@ app.options("board_select", async ({ options, ack, logger }) => {
     await ack({ options: boardOptions });
   } catch (e) {
     logger.error(e);
-    console.error("[OPTIONS] board_select error:", e?.message || e);
     await ack({
       options: [
         {
@@ -191,15 +184,55 @@ app.options("board_select", async ({ options, ack, logger }) => {
   }
 });
 
-// Group dropdown options (depends on selected board)
+// ✅ FIX: store board selection in private_metadata so group_select can reliably read it
+app.action("board_select", async ({ ack, body, client, logger }) => {
+  await ack();
+
+  try {
+    const selectedBoardId = body?.actions?.[0]?.selected_option?.value || "";
+    const view = body?.view;
+
+    if (!view?.id || !selectedBoardId) return;
+
+    let meta = {};
+    try {
+      meta = JSON.parse(view.private_metadata || "{}");
+    } catch {
+      meta = {};
+    }
+
+    meta.boardId = selectedBoardId;
+
+    await client.views.update({
+      view_id: view.id,
+      hash: view.hash,
+      view: {
+        ...view,
+        private_metadata: JSON.stringify(meta),
+      },
+    });
+
+    console.log("[ACTION] board_select stored boardId:", selectedBoardId);
+  } catch (e) {
+    logger.error(e);
+  }
+});
+
 app.options("group_select", async ({ body, options, ack, logger }) => {
-  const boardId =
-    body?.view?.state?.values?.board_block?.board_select?.selected_option?.value || "";
+  // ✅ Read boardId from private_metadata (reliable)
+  const boardId = (() => {
+    try {
+      const meta = JSON.parse(body?.view?.private_metadata || "{}");
+      return meta.boardId || "";
+    } catch {
+      return "";
+    }
+  })();
 
   console.log("[OPTIONS] group_select fired; boardId:", boardId, "; search:", options?.value);
 
   try {
-    if (!boardId || boardId.startsWith("ERROR") || boardId.startsWith("NO_")) {
+    if (!boardId) {
       return await ack({
         options: [
           {
@@ -213,7 +246,6 @@ app.options("group_select", async ({ body, options, ack, logger }) => {
     const groupOptions = await fetchGroups(boardId, options?.value || "");
 
     if (!groupOptions.length) {
-      console.warn("[OPTIONS] No groups returned for board:", boardId);
       return await ack({
         options: [
           {
@@ -228,7 +260,6 @@ app.options("group_select", async ({ body, options, ack, logger }) => {
     await ack({ options: groupOptions });
   } catch (e) {
     logger.error(e);
-    console.error("[OPTIONS] group_select error:", e?.message || e);
     await ack({
       options: [
         {
@@ -255,6 +286,7 @@ app.command("/cstask", async ({ ack, body, client, logger }) => {
         title: { type: "plain_text", text: "Create CS Task" },
         submit: { type: "plain_text", text: "Create" },
         close: { type: "plain_text", text: "Cancel" },
+        private_metadata: JSON.stringify({}), // will store boardId later
         blocks: [
           {
             type: "input",
@@ -267,7 +299,11 @@ app.command("/cstask", async ({ ack, body, client, logger }) => {
             block_id: "description_block",
             optional: true,
             label: { type: "plain_text", text: "Description" },
-            element: { type: "plain_text_input", action_id: "description_input", multiline: true },
+            element: {
+              type: "plain_text_input",
+              action_id: "description_input",
+              multiline: true,
+            },
           },
           {
             type: "input",
@@ -275,9 +311,12 @@ app.command("/cstask", async ({ ack, body, client, logger }) => {
             label: { type: "plain_text", text: "Task Owner" },
             element: { type: "users_select", action_id: "owner_user_select" },
           },
+
+          // ✅ Dynamic Board (dispatch_action is required)
           {
             type: "input",
             block_id: "board_block",
+            dispatch_action: true,
             label: { type: "plain_text", text: "Monday Board" },
             element: {
               type: "external_select",
@@ -286,6 +325,8 @@ app.command("/cstask", async ({ ack, body, client, logger }) => {
               min_query_length: 0,
             },
           },
+
+          // ✅ Dynamic Group (depends on board stored in private_metadata)
           {
             type: "input",
             block_id: "group_block",
@@ -297,6 +338,7 @@ app.command("/cstask", async ({ ack, body, client, logger }) => {
               min_query_length: 0,
             },
           },
+
           {
             type: "input",
             block_id: "status_block",
@@ -343,8 +385,15 @@ app.view("cstask_modal_submit", async ({ ack, body, view, client, logger }) => {
   const ownerSlackUserId =
     view.state.values.owner_block.owner_user_select.selected_user || "";
 
-  const boardId =
-    view.state.values.board_block.board_select.selected_option?.value || "";
+  // ✅ Read boardId from private_metadata (reliable)
+  const boardId = (() => {
+    try {
+      const meta = JSON.parse(view.private_metadata || "{}");
+      return meta.boardId || "";
+    } catch {
+      return "";
+    }
+  })();
 
   const groupId =
     view.state.values.group_block.group_select.selected_option?.value || "";
@@ -359,10 +408,8 @@ app.view("cstask_modal_submit", async ({ ack, body, view, client, logger }) => {
   const errors = {};
   if (!taskName) errors["task_name_block"] = "Task name is required.";
   if (!ownerSlackUserId) errors["owner_block"] = "Please select an owner.";
-  if (!boardId || boardId.startsWith("ERROR") || boardId.startsWith("NO_"))
-    errors["board_block"] = "Please select a valid board.";
-  if (!groupId || groupId.startsWith("ERROR") || groupId.startsWith("NO_"))
-    errors["group_block"] = "Please select a valid group.";
+  if (!boardId) errors["board_block"] = "Please select a board.";
+  if (!groupId) errors["group_block"] = "Please select a group.";
   if (!statusLabel) errors["status_block"] = "Please select a status.";
   if (!priorityLabel) errors["priority_block"] = "Please select a priority.";
 
@@ -399,7 +446,7 @@ app.view("cstask_modal_submit", async ({ ack, body, view, client, logger }) => {
       {
         source: "slack",
         command_name: "cstask",
-        version: "v3",
+        version: "v3.1",
         task_name: taskName,
         description,
         task_owner_slack_user_id: ownerSlackUserId,
@@ -439,5 +486,5 @@ app.view("cstask_modal_submit", async ({ ack, body, view, client, logger }) => {
 // ==============================
 (async () => {
   await app.start(process.env.PORT || 3000);
-  console.log("⚡️ SyllaBot is running (dynamic board/group enabled)");
+  console.log("⚡️ SyllaBot is running (board->group fixed via private_metadata)");
 })();
