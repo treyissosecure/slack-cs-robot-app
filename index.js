@@ -6,9 +6,18 @@ const ZAPIER_WEBHOOK_URL =
   process.env.ZAPIER_WEBHOOK_URL ||
   "https://hooks.zapier.com/hooks/catch/25767132/ug29zll/";
 
-// ===== Receiver with split endpoints (Bolt-supported) =====
-// Use endpoints so Slack can hit different URLs for commands vs interactions.
-// This avoids "Could not determine the type..." warnings.  [oai_citation:3‡HackerNoon](https://hackernoon.com/writing-a-slack-bot-that-responds-to-action-commands-v73b3tba?utm_source=chatgpt.com)
+// Monday labels (must match exactly)
+const STATUS_LABELS = [
+  "Not Started",
+  "Working on it",
+  "Blocked",
+  "Pending Review",
+  "Done",
+];
+
+const PRIORITY_LABELS = ["Low", "Medium", "High"];
+
+// ===== Receiver with split endpoints =====
 const receiver = new ExpressReceiver({
   signingSecret: process.env.SLACK_SIGNING_SECRET,
   endpoints: {
@@ -23,9 +32,16 @@ const app = new App({
   receiver,
 });
 
+function toStaticOptions(labels) {
+  return labels.map((label) => ({
+    text: { type: "plain_text", text: label },
+    value: label, // send label itself to Zapier
+  }));
+}
+
 // ===== Slash command: /cstask =====
 app.command("/cstask", async ({ ack, body, client, logger }) => {
-  await ack(); // must happen within ~3 seconds
+  await ack();
 
   try {
     await client.views.open({
@@ -69,12 +85,33 @@ app.command("/cstask", async ({ ack, body, client, logger }) => {
               placeholder: { type: "plain_text", text: "Select a Slack user" },
             },
           },
+          {
+            type: "input",
+            block_id: "status_block",
+            label: { type: "plain_text", text: "Status" },
+            element: {
+              type: "static_select",
+              action_id: "status_select",
+              placeholder: { type: "plain_text", text: "Select a status" },
+              options: toStaticOptions(STATUS_LABELS),
+            },
+          },
+          {
+            type: "input",
+            block_id: "priority_block",
+            label: { type: "plain_text", text: "Priority" },
+            element: {
+              type: "static_select",
+              action_id: "priority_select",
+              placeholder: { type: "plain_text", text: "Select a priority" },
+              options: toStaticOptions(PRIORITY_LABELS),
+            },
+          },
         ],
       },
     });
   } catch (e) {
     logger.error(e);
-    // best-effort DM if modal open fails
     try {
       await client.chat.postMessage({
         channel: body.user_id,
@@ -92,13 +129,23 @@ app.view("cstask_modal_submit", async ({ ack, body, view, client, logger }) => {
     view.state.values.task_name_block.task_name_input.value?.trim() || "";
   const description =
     view.state.values.description_block?.description_input?.value?.trim() || "";
+
   const ownerSlackUserId =
     view.state.values.owner_block.owner_user_select.selected_user || "";
 
-  // Inline validation (shows errors in the modal)
+  const statusLabel =
+    view.state.values.status_block.status_select.selected_option?.value || "";
+
+  const priorityLabel =
+    view.state.values.priority_block.priority_select.selected_option?.value || "";
+
+  // Inline validation
   const errors = {};
   if (!taskName) errors["task_name_block"] = "Task name is required.";
   if (!ownerSlackUserId) errors["owner_block"] = "Please select an owner.";
+  if (!statusLabel) errors["status_block"] = "Please select a status.";
+  if (!priorityLabel) errors["priority_block"] = "Please select a priority.";
+
   if (Object.keys(errors).length) {
     await ack({ response_action: "errors", errors });
     return;
@@ -106,15 +153,7 @@ app.view("cstask_modal_submit", async ({ ack, body, view, client, logger }) => {
 
   await ack();
 
-  if (!ZAPIER_WEBHOOK_URL) {
-    await client.chat.postMessage({
-      channel: body.user.id,
-      text: "❌ ZAPIER_WEBHOOK_URL is missing. Add it in Render Environment Variables and redeploy.",
-    });
-    return;
-  }
-
-  // Look up owner's email from Slack (requires users:read.email + reinstall)
+  // Look up owner's email (requires users:read.email + reinstall)
   let taskOwnerEmail = null;
   try {
     const userInfo = await client.users.info({ user: ownerSlackUserId });
@@ -133,16 +172,20 @@ app.view("cstask_modal_submit", async ({ ack, body, view, client, logger }) => {
     return;
   }
 
-  // Send to Zapier
+  // Send to Zapier (includes status + priority)
   try {
     await axios.post(
       ZAPIER_WEBHOOK_URL,
       {
         source: "slack",
+        command_name: "cstask",
+        version: "v2",
         task_name: taskName,
         description,
         task_owner_slack_user_id: ownerSlackUserId,
         task_owner_email: taskOwnerEmail,
+        status_label: statusLabel,
+        priority_label: priorityLabel,
         submitted_by_slack_user_id: body.user.id,
         submitted_at: new Date().toISOString(),
       },
@@ -151,7 +194,12 @@ app.view("cstask_modal_submit", async ({ ack, body, view, client, logger }) => {
 
     await client.chat.postMessage({
       channel: body.user.id,
-      text: `✅ Task sent to Zapier!\n• *Task:* ${taskName}\n• *Owner email:* ${taskOwnerEmail}`,
+      text:
+        `✅ Task sent to Zapier!\n` +
+        `• *Task:* ${taskName}\n` +
+        `• *Status:* ${statusLabel}\n` +
+        `• *Priority:* ${priorityLabel}\n` +
+        `• *Owner:* ${taskOwnerEmail}`,
     });
   } catch (e) {
     logger.error(e);
@@ -166,5 +214,5 @@ app.view("cstask_modal_submit", async ({ ack, body, view, client, logger }) => {
 // ===== Start server =====
 (async () => {
   await app.start(process.env.PORT || 3000);
-  console.log("⚡️ SyllaBot is running");
+  console.log("⚡️ SyllaBot is running (cstask v2)");
 })();
