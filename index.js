@@ -958,33 +958,6 @@ function buildHubnoteModalV2({ correlationId, originChannelId, originUserId }) {
 // ==============================
 // /hubnote COMMAND -> OPEN v2 MODAL (default to v2)
 // ==============================
-app.command("/hubnote", async ({ ack, body, client, logger }) => {
-  await ack();
-
-  try {
-    const correlationId = hubnoteMakeId("hubnote");
-    await client.views.open({
-      trigger_id: body.trigger_id,
-      view: buildHubnoteModalV2({
-        correlationId,
-        originChannelId: body.channel_id,
-        originUserId: body.user_id,
-      }),
-    });
-  } catch (e) {
-    logger.error(e);
-    try {
-      await client.chat.postMessage({
-        channel: body.user_id,
-        text: "❌ I couldn’t open the HubSpot note form. Please try again.",
-      });
-    } catch (_) {}
-  }
-});
-
-// ==============================
-// hubnote v2 dispatch_action handlers (store selections in private_metadata)
-// ==============================
 app.action("hubnote_v2_record_type_select", async ({ ack, body, client, logger }) => {
   await ack();
 
@@ -994,15 +967,65 @@ app.action("hubnote_v2_record_type_select", async ({ ack, body, client, logger }
     if (!view?.id || !selected) return;
 
     const meta = parsePrivateMetadata(view.private_metadata);
-    meta.recordType = selected;
-    meta.pipelineId = ""; // clear downstream
-    meta.stageId = "";
 
-    const cleanView = buildCleanViewPayload(view, JSON.stringify(meta));
+    // reset downstream + bump nonce
+    const nextMeta = {
+      ...meta,
+      recordType: selected,
+      pipelineId: "",
+      stageId: "",
+      depsNonce: String(Number(meta.depsNonce || "0") + 1),
+    };
+
+    // rebuild modal (preserves title/body blocks, forces stage/record reset)
+    const rebuilt = buildHubnoteModalV2({
+      correlationId: nextMeta.correlationId,
+      originChannelId: nextMeta.originChannelId,
+      originUserId: nextMeta.originUserId,
+      metaOverride: nextMeta,
+    });
+
     await client.views.update({
       view_id: view.id,
       hash: view.hash,
-      view: cleanView,
+      view: rebuilt,
+    });
+  } catch (e) {
+    logger.error(e);
+  }
+});
+// ==============================
+// hubnote v2 dispatch_action handlers (store selections in private_metadata)
+// ==============================
+app.action("hubnote_v2_pipeline_select", async ({ ack, body, client, logger }) => {
+  await ack();
+
+  try {
+    const view = body.view;
+    const pipelineId = body?.actions?.[0]?.selected_option?.value || "";
+    if (!view?.id || !pipelineId) return;
+
+    const meta = parsePrivateMetadata(view.private_metadata);
+
+    // reset downstream + bump nonce
+    const nextMeta = {
+      ...meta,
+      pipelineId,
+      stageId: "",
+      depsNonce: String(Number(meta.depsNonce || "0") + 1),
+    };
+
+    const rebuilt = buildHubnoteModalV2({
+      correlationId: nextMeta.correlationId,
+      originChannelId: nextMeta.originChannelId,
+      originUserId: nextMeta.originUserId,
+      metaOverride: nextMeta,
+    });
+
+    await client.views.update({
+      view_id: view.id,
+      hash: view.hash,
+      view: rebuilt,
     });
   } catch (e) {
     logger.error(e);
@@ -1033,19 +1056,31 @@ app.action("hubnote_v2_pipeline_select", async ({ ack, body, client, logger }) =
 
 app.action("hubnote_v2_stage_select", async ({ ack, body, client, logger }) => {
   await ack();
+
   try {
     const view = body.view;
     const stageId = body?.actions?.[0]?.selected_option?.value || "";
     if (!view?.id || !stageId) return;
 
     const meta = parsePrivateMetadata(view.private_metadata);
-    meta.stageId = stageId;
 
-    const cleanView = buildCleanViewPayload(view, JSON.stringify(meta));
+    const nextMeta = {
+      ...meta,
+      stageId,
+      depsNonce: String(Number(meta.depsNonce || "0") + 1),
+    };
+
+    const rebuilt = buildHubnoteModalV2({
+      correlationId: nextMeta.correlationId,
+      originChannelId: nextMeta.originChannelId,
+      originUserId: nextMeta.originUserId,
+      metaOverride: nextMeta,
+    });
+
     await client.views.update({
       view_id: view.id,
       hash: view.hash,
-      view: cleanView,
+      view: rebuilt,
     });
   } catch (e) {
     logger.error(e);
@@ -1181,6 +1216,11 @@ app.view("hubnote_modal_submit_v2", async ({ ack, body, view, client, logger }) 
   const correlationId = meta.correlationId || hubnoteMakeId("hubnote");
   const originChannelId = meta.originChannelId || body.user.id;
   const originUserId = meta.originUserId || body.user.id;
+  const recordId = findSelectedOptionValue(view.state.values, "hubnote_v2_record_select");
+  const pipelineIdFromState = findSelectedOptionValue(view.state.values, "hubnote_v2_pipeline_select");
+  const stageIdFromState = findSelectedOptionValue(view.state.values, "hubnote_v2_stage_select");
+  const pipelineId = pipelineIdFromState || meta.pipelineId || "";
+  const stageId = stageIdFromState || meta.stageId || "";
 
   const recordType =
     view.state.values.record_type_block_v2?.hubnote_v2_record_type_select?.selected_option?.value ||
@@ -1197,8 +1237,16 @@ app.view("hubnote_modal_submit_v2", async ({ ack, body, view, client, logger }) 
     meta.stageId ||
     "";
 
-  const recordId =
-    view.state.values.record_block_v2?.hubnote_v2_record_select?.selected_option?.value || "";
+  function findSelectedOptionValue(viewStateValues, actionId) {
+  const blocks = viewStateValues || {};
+  for (const blockId of Object.keys(blocks)) {
+    const actions = blocks[blockId] || {};
+    if (actions[actionId]?.selected_option?.value) {
+      return actions[actionId].selected_option.value;
+    }
+  }
+  return "";
+}
 
   const noteTitle =
     view.state.values.note_title_block_v2?.hubnote_v2_note_title_input?.value?.trim() || "";
