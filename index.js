@@ -105,6 +105,17 @@ function buildCleanViewPayload(view, privateMetadataString) {
   };
 }
 
+function findSelectedOptionValue(viewStateValues, actionId) {
+  const blocks = viewStateValues || {};
+  for (const blockId of Object.keys(blocks)) {
+    const actions = blocks[blockId] || {};
+    if (actions[actionId]?.selected_option?.value) {
+      return actions[actionId].selected_option.value;
+    }
+  }
+  return "";
+}
+
 // ==============================
 // MONDAY API HELPERS
 // ==============================
@@ -1216,37 +1227,16 @@ app.view("hubnote_modal_submit_v2", async ({ ack, body, view, client, logger }) 
   const correlationId = meta.correlationId || hubnoteMakeId("hubnote");
   const originChannelId = meta.originChannelId || body.user.id;
   const originUserId = meta.originUserId || body.user.id;
-  const recordId = findSelectedOptionValue(view.state.values, "hubnote_v2_record_select");
+
+  // Pull selects safely even when block_ids change (nonce strategy)
+  const recordTypeFromState = findSelectedOptionValue(view.state.values, "hubnote_v2_record_type_select");
   const pipelineIdFromState = findSelectedOptionValue(view.state.values, "hubnote_v2_pipeline_select");
   const stageIdFromState = findSelectedOptionValue(view.state.values, "hubnote_v2_stage_select");
+  const recordId = findSelectedOptionValue(view.state.values, "hubnote_v2_record_select");
+
+  const recordType = recordTypeFromState || meta.recordType || "";
   const pipelineId = pipelineIdFromState || meta.pipelineId || "";
   const stageId = stageIdFromState || meta.stageId || "";
-
-  const recordType =
-    view.state.values.record_type_block_v2?.hubnote_v2_record_type_select?.selected_option?.value ||
-    meta.recordType ||
-    "";
-
-  const pipelineId =
-    view.state.values.pipeline_block_v2?.hubnote_v2_pipeline_select?.selected_option?.value ||
-    meta.pipelineId ||
-    "";
-
-  const stageId =
-    view.state.values.stage_block_v2?.hubnote_v2_stage_select?.selected_option?.value ||
-    meta.stageId ||
-    "";
-
-  function findSelectedOptionValue(viewStateValues, actionId) {
-  const blocks = viewStateValues || {};
-  for (const blockId of Object.keys(blocks)) {
-    const actions = blocks[blockId] || {};
-    if (actions[actionId]?.selected_option?.value) {
-      return actions[actionId].selected_option.value;
-    }
-  }
-  return "";
-}
 
   const noteTitle =
     view.state.values.note_title_block_v2?.hubnote_v2_note_title_input?.value?.trim() || "";
@@ -1257,13 +1247,42 @@ app.view("hubnote_modal_submit_v2", async ({ ack, body, view, client, logger }) 
   const errors = {};
   if (!recordType) errors["record_type_block_v2"] = "Select Ticket or Deal.";
   if (!pipelineId) errors["pipeline_block_v2"] = "Select a pipeline.";
-  if (!stageId) errors["stage_block_v2"] = "Select a stage.";
-  if (!recordId) errors["record_block_v2"] = "Select a record.";
+  if (!stageId) errors["stage_block_v2_0"] = "Select a stage."; // fallback key (Slack highlights closest)
+  if (!recordId) errors["record_block_v2_0"] = "Select a record.";
   if (!noteTitle) errors["note_title_block_v2"] = "Note title is required.";
   if (!noteBody) errors["note_body_block_v2"] = "Note body is required.";
 
-  if (Object.keys(errors).length) {
-    await ack({ response_action: "errors", errors });
+  // Slack requires exact block_id keys for field-level errors.
+  // Because stage/record block_ids are dynamic (nonce), we "best effort" by:
+  // - using note_title/body fixed ids (works)
+  // - and if stage/record missing, just show a general error message after ack.
+  const hasBlockingErrors = !recordType || !pipelineId || !stageId || !recordId || !noteTitle || !noteBody;
+
+  if (hasBlockingErrors) {
+    // Prefer showing inline errors for fixed blocks; otherwise ack then DM/ephemeral a message
+    const inlineErrors = {};
+    if (!recordType) inlineErrors["record_type_block_v2"] = errors["record_type_block_v2"];
+    if (!pipelineId) inlineErrors["pipeline_block_v2"] = errors["pipeline_block_v2"];
+    if (!noteTitle) inlineErrors["note_title_block_v2"] = errors["note_title_block_v2"];
+    if (!noteBody) inlineErrors["note_body_block_v2"] = errors["note_body_block_v2"];
+
+    if (Object.keys(inlineErrors).length) {
+      await ack({ response_action: "errors", errors: inlineErrors });
+    } else {
+      await ack();
+    }
+
+    // For dynamic blocks, send user-friendly guidance
+    if (!recordType || !pipelineId || !stageId || !recordId) {
+      try {
+        await client.chat.postEphemeral({
+          channel: originChannelId,
+          user: originUserId,
+          text: "⚠️ Please select Record Type → Pipeline → Stage → Record before submitting.",
+        });
+      } catch (_) {}
+    }
+
     return;
   }
 
@@ -1313,123 +1332,6 @@ app.view("hubnote_modal_submit_v2", async ({ ack, body, view, client, logger }) 
     });
   }
 });
-
-// ==============================
-// Zapier -> SyllaBot callback (note created) -> ephemeral Yes/No in origin
-// ==============================
-receiver.app.post("/zapier/hubnote/callback", express.json(), async (req, res) => {
-  try {
-    if (ZAPIER_HUBNOTE_SECRET) {
-      const incoming = req.headers["x-zapier-secret"];
-      if (!incoming || incoming !== ZAPIER_HUBNOTE_SECRET) {
-        return res.status(401).json({ ok: false, error: "unauthorized" });
-      }
-    }
-
-    const {
-      status,
-      correlation_id,
-      hubspot_note_id,
-      hubspot_object_type,
-      hubspot_object_id,
-      origin_channel_id,
-      origin_user_id,
-    } = req.body || {};
-
-    if (!origin_channel_id || !origin_user_id) {
-      return res
-        .status(400)
-        .json({ ok: false, error: "missing origin_channel_id/origin_user_id" });
-    }
-
-    if (status !== "success" || !hubspot_note_id) {
-      await app.client.chat.postEphemeral({
-        channel: origin_channel_id,
-        user: origin_user_id,
-        text: "❌ HubSpot note creation failed. Check Zapier logs for details.",
-      });
-      return res.status(200).json({ ok: true, handled: "failure" });
-    }
-
-    const sessionId = hubnoteMakeId("hubnote_session");
-
-    hubnoteSetSession(sessionId, {
-      correlationId: correlation_id,
-      hubspotNoteId: String(hubspot_note_id),
-      hubspotObjectType: hubspot_object_type || "ticket",
-      hubspotObjectId: hubspot_object_id ? String(hubspot_object_id) : "",
-      originChannelId: origin_channel_id,
-      originUserId: origin_user_id,
-      dmChannelId: "",
-    });
-
-    await app.client.chat.postEphemeral({
-      channel: origin_channel_id,
-      user: origin_user_id,
-      ...buildHubnoteAddFilesEphemeral({ sessionId }),
-    });
-
-    return res.status(200).json({ ok: true, sessionId });
-  } catch (e) {
-    console.error("[hubnote callback] error:", e?.message || e);
-    return res.status(500).json({ ok: false, error: "server_error" });
-  }
-});
-
-// ==============================
-// Ephemeral button handlers: YES/NO
-// ==============================
-app.action("hubnote_add_files_no", async ({ ack, body, client, logger }) => {
-  await ack();
-  try {
-    const sessionId = body?.actions?.[0]?.value || "";
-    if (sessionId) hubnoteDeleteSession(sessionId);
-
-    const channelId = body?.channel?.id;
-    const userId = body?.user?.id;
-    if (channelId && userId) {
-      await client.chat.postEphemeral({
-        channel: channelId,
-        user: userId,
-        text: "✅ All set — no files added.",
-      });
-    }
-  } catch (e) {
-    logger.error(e);
-  }
-});
-
-app.action("hubnote_add_files_yes", async ({ ack, body, client, logger }) => {
-  await ack();
-
-  try {
-    const sessionId = body?.actions?.[0]?.value || "";
-    const session = hubnoteGetSession(sessionId);
-
-    if (!session) {
-      const channelId = body?.channel?.id;
-      const userId = body?.user?.id;
-      if (channelId && userId) {
-        await client.chat.postEphemeral({
-          channel: channelId,
-          user: userId,
-          text: "⚠️ That attachment session expired. Please run /hubnote again if needed.",
-        });
-      }
-      return;
-    }
-
-    const dm = await client.conversations.open({ users: session.originUserId });
-    const dmChannelId = dm?.channel?.id;
-
-    if (!dmChannelId) {
-      await client.chat.postEphemeral({
-        channel: session.originChannelId,
-        user: session.originUserId,
-        text: "❌ I couldn’t open a DM for file uploads. Please try again.",
-      });
-      return;
-    }
 
     hubnoteSetSession(sessionId, { ...session, dmChannelId });
 
