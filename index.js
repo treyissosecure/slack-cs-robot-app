@@ -1,37 +1,3 @@
-/**
- * index.js — SyllaBot (Slack Bolt + Express) on Render
- *
- * ✅ /cstask remains untouched
- * ✅ /hubnote v1 remains functional (trigger with: /hubnote v1)
- * ✅ /hubnote v2 is now the default (dynamic lookups: Record Type → Pipeline → Stage → Record)
- * ✅ Keeps your split endpoints, metadata helpers, logging style, error handling patterns
- * ✅ Keeps your existing Hubnote “Add files?” → DM → Attach modal flow intact
- *
- * REQUIRED ENV VARS (existing):
- * - SLACK_SIGNING_SECRET
- * - SLACK_BOT_TOKEN
- * - MONDAY_API_TOKEN
- * - ZAPIER_WEBHOOK_URL (for /cstask)
- *
- * REQUIRED ENV VARS (hubnote):
- * - ZAPIER_HUBNOTE_WEBHOOK_URL (SyllaBot -> Zapier: create note + associate)
- * - HUBSPOT_PRIVATE_APP_TOKEN (SyllaBot -> HubSpot: dynamic lookups)
- *
- * OPTIONAL ENV VARS (hubnote):
- * - ZAPIER_HUBNOTE_ATTACH_WEBHOOK_URL (SyllaBot -> Zapier: attach files)
- * - ZAPIER_HUBNOTE_SECRET (Zapier -> SyllaBot callback auth)
- *
- * SLACK SCOPES YOU’LL NEED FOR HUBNOTE:
- * - commands
- * - chat:write
- * - im:write (open DM after Yes)
- * - files:read (file picker)
- *
- * HubSpot stage properties (confirmed):
- * - Tickets: hs_pipeline_stage
- * - Deals: dealstage
- */
-
 const { App, ExpressReceiver, LogLevel } = require("@slack/bolt");
 const axios = require("axios");
 const express = require("express");
@@ -42,16 +8,15 @@ const crypto = require("crypto");
 // ==============================
 const ZAPIER_WEBHOOK_URL =
   process.env.ZAPIER_WEBHOOK_URL ||
-  "https://hooks.zapier.com/hooks/catch/25767132/ug29zll/";
+  "https://hooks.zapier.com/hooks/catch/25767132/ug29zll/"; // /cstask
 
-const MONDAY_API_TOKEN = process.env.MONDAY_API_TOKEN;
-
-// HubSpot + hubnote config
-const HUBSPOT_PRIVATE_APP_TOKEN = process.env.HUBSPOT_PRIVATE_APP_TOKEN || "";
 const ZAPIER_HUBNOTE_WEBHOOK_URL = process.env.ZAPIER_HUBNOTE_WEBHOOK_URL || "";
 const ZAPIER_HUBNOTE_ATTACH_WEBHOOK_URL =
   process.env.ZAPIER_HUBNOTE_ATTACH_WEBHOOK_URL || "";
 const ZAPIER_HUBNOTE_SECRET = process.env.ZAPIER_HUBNOTE_SECRET || "";
+
+const MONDAY_API_TOKEN = process.env.MONDAY_API_TOKEN;
+const HUBSPOT_PRIVATE_APP_TOKEN = process.env.HUBSPOT_PRIVATE_APP_TOKEN || "";
 
 // Monday labels (must match exactly)
 const STATUS_LABELS = [
@@ -61,7 +26,6 @@ const STATUS_LABELS = [
   "Pending Review",
   "Done",
 ];
-
 const PRIORITY_LABELS = ["Low", "Medium", "High"];
 
 function toStaticOptions(labels) {
@@ -112,9 +76,34 @@ receiver.app.get("/", (req, res) => res.status(200).send("OK"));
 const app = new App({
   token: process.env.SLACK_BOT_TOKEN,
   receiver,
-  // You can change to LogLevel.INFO later
   logLevel: LogLevel.DEBUG,
 });
+
+// ==============================
+// HELPERS: metadata
+// ==============================
+function parsePrivateMetadata(md) {
+  try {
+    return JSON.parse(md || "{}");
+  } catch {
+    return {};
+  }
+}
+
+function buildCleanViewPayload(view, privateMetadataString) {
+  // Slack views.update expects a "view payload" schema (not Slack's returned view object)
+  return {
+    type: "modal",
+    callback_id: view.callback_id,
+    title: view.title,
+    submit: view.submit,
+    close: view.close,
+    blocks: view.blocks,
+    private_metadata: privateMetadataString ?? view.private_metadata ?? "",
+    clear_on_close: view.clear_on_close,
+    notify_on_close: view.notify_on_close,
+  };
+}
 
 // ==============================
 // MONDAY API HELPERS
@@ -218,29 +207,140 @@ async function fetchGroups(boardId, search = "") {
 }
 
 // ==============================
-// HELPERS: metadata
+// HUBSPOT HELPERS (for hubnote v2 dropdowns)
 // ==============================
-function parsePrivateMetadata(md) {
-  try {
-    return JSON.parse(md || "{}");
-  } catch {
-    return {};
-  }
+const HS_CACHE_MS = 10 * 60 * 1000; // 10 min
+const hsCache = {
+  pipelines: new Map(), // key: "ticket"|"deal" -> { at, pipelines:[{id,label,stages:[{id,label}]}] }
+};
+
+const HS_TICKET_STAGE_PROP = "hs_pipeline_stage";
+const HS_DEAL_STAGE_PROP = "dealstage";
+const HS_PIPELINE_PROP_DEAL = "pipeline";
+const HS_PIPELINE_PROP_TICKET = "hs_pipeline";
+
+function hsApiObjectType(recordType) {
+  // HubSpot API endpoints use plural object names
+  return recordType === "deal" ? "deals" : "tickets";
 }
 
-function buildCleanViewPayload(view, privateMetadataString) {
-  // Slack views.update expects a "view payload" schema (not Slack's returned view object)
-  return {
-    type: "modal",
-    callback_id: view.callback_id,
-    title: view.title,
-    submit: view.submit,
-    close: view.close,
-    blocks: view.blocks,
-    private_metadata: privateMetadataString ?? view.private_metadata ?? "",
-    clear_on_close: view.clear_on_close,
-    notify_on_close: view.notify_on_close,
+async function hubspotRequest(method, path, data) {
+  if (!HUBSPOT_PRIVATE_APP_TOKEN) {
+    throw new Error("Missing HUBSPOT_PRIVATE_APP_TOKEN");
+  }
+
+  const url = `https://api.hubapi.com${path}`;
+
+  const res = await axios.request({
+    method,
+    url,
+    data,
+    timeout: 15000,
+    headers: {
+      Authorization: `Bearer ${HUBSPOT_PRIVATE_APP_TOKEN}`,
+      "Content-Type": "application/json",
+    },
+  });
+
+  return res.data;
+}
+
+function hsCacheGetPipelines(recordType) {
+  const key = recordType === "deal" ? "deal" : "ticket";
+  const cached = hsCache.pipelines.get(key);
+  if (!cached) return null;
+  if (Date.now() - cached.at > HS_CACHE_MS) return null;
+  return cached.pipelines || null;
+}
+
+function hsCacheSetPipelines(recordType, pipelines) {
+  const key = recordType === "deal" ? "deal" : "ticket";
+  hsCache.pipelines.set(key, { at: Date.now(), pipelines: pipelines || [] });
+}
+
+function hsPipelineLabel(p) {
+  return (
+    p?.label ||
+    p?.displayName ||
+    p?.name ||
+    `Pipeline ${p?.id || ""}`.trim()
+  );
+}
+
+function hsStageLabel(s) {
+  return s?.label || s?.displayName || s?.name || `Stage ${s?.id || ""}`.trim();
+}
+
+async function hsGetPipelines(recordType) {
+  const rt = recordType === "deal" ? "deal" : "ticket";
+  const cached = hsCacheGetPipelines(rt);
+  if (cached) return cached;
+
+  const objectType = hsApiObjectType(rt); // "deals" or "tickets"
+  const data = await hubspotRequest("GET", `/crm/v3/pipelines/${objectType}`);
+
+  const results = data?.results || [];
+  const pipelines = results.map((p) => {
+    const stages = (p?.stages || []).map((s) => ({
+      id: String(s.id),
+      label: hsStageLabel(s),
+    }));
+
+    return {
+      id: String(p.id),
+      label: hsPipelineLabel(p),
+      stages,
+    };
+  });
+
+  hsCacheSetPipelines(rt, pipelines);
+  return pipelines;
+}
+
+async function hsSearchRecords({ recordType, pipelineId, stageId, query }) {
+  const objectType = hsApiObjectType(recordType);
+
+  const stageProp = recordType === "deal" ? HS_DEAL_STAGE_PROP : HS_TICKET_STAGE_PROP;
+  const pipelineProp =
+    recordType === "deal" ? HS_PIPELINE_PROP_DEAL : HS_PIPELINE_PROP_TICKET;
+
+  const properties =
+    recordType === "deal"
+      ? ["dealname", pipelineProp, stageProp]
+      : ["subject", pipelineProp, stageProp];
+
+  const body = {
+    filterGroups: [
+      {
+        filters: [
+          { propertyName: pipelineProp, operator: "EQ", value: String(pipelineId) },
+          { propertyName: stageProp, operator: "EQ", value: String(stageId) },
+        ],
+      },
+    ],
+    properties,
+    limit: 50,
   };
+
+  const q = (query || "").trim();
+  if (q) body.query = q;
+
+  const data = await hubspotRequest(
+    "POST",
+    `/crm/v3/objects/${objectType}/search`,
+    body
+  );
+
+  const results = data?.results || [];
+  return results.map((r) => {
+    const id = String(r.id);
+    const props = r.properties || {};
+    const label =
+      recordType === "deal"
+        ? props.dealname || `Deal ${id}`
+        : props.subject || `Ticket ${id}`;
+    return { id, label };
+  });
 }
 
 // ==============================
@@ -248,54 +348,21 @@ function buildCleanViewPayload(view, privateMetadataString) {
 // ==============================
 
 // Board dropdown options
-app.options("hubnote_v2_pipeline_select", async ({ ack, body, options, logger }) => {
+app.options("board_select", async ({ options, ack, logger }) => {
   try {
-    const meta = parsePrivateMetadata(body?.view?.private_metadata);
-    const recordType = meta.recordType || "ticket";
-    const q = (options?.value || "").trim().toLowerCase();
+    const search = options?.value || "";
+    const boardOptions = await fetchBoards(search);
 
-    const pipelines = await hsGetPipelines(recordType);
-
-    const opts = (pipelines || [])
-      .filter((p) => !q || String(p.label || "").toLowerCase().includes(q))
-      .slice(0, 100)
-      .map((p) => ({
-        text: { type: "plain_text", text: (String(p.label || "Unnamed pipeline")).slice(0, 75) },
-        value: String(p.id),
-      }));
-
-    if (!opts.length) {
+    if (!boardOptions.length) {
       return await ack({
         options: [
-          { text: { type: "plain_text", text: "No pipelines found" }, value: "NO_PIPELINES_FOUND" },
+          {
+            text: { type: "plain_text", text: "No boards found" },
+            value: "NO_BOARDS_FOUND",
+          },
         ],
       });
     }
-
-    await ack({ options: opts });
-  } catch (e) {
-    logger.error(e);
-    await ack({
-      options: [
-        { text: { type: "plain_text", text: "ERROR loading pipelines (check logs)" }, value: "ERROR_LOADING_PIPELINES" },
-      ],
-    });
-  }
-});
-
-    await ack({ options: opts });
-  } catch (e) {
-    logger.error(e);
-    await ack({
-      options: [
-        {
-          text: { type: "plain_text", text: "ERROR loading pipelines (check logs)" },
-          value: "ERROR_LOADING_PIPELINES",
-        },
-      ],
-    });
-  }
-});
 
     await ack({ options: boardOptions });
   } catch (e) {
@@ -303,10 +370,7 @@ app.options("hubnote_v2_pipeline_select", async ({ ack, body, options, logger })
     await ack({
       options: [
         {
-          text: {
-            type: "plain_text",
-            text: "ERROR loading boards (check Render logs)",
-          },
+          text: { type: "plain_text", text: "ERROR loading boards (check Render logs)" },
           value: "ERROR_LOADING_BOARDS",
         },
       ],
@@ -314,21 +378,19 @@ app.options("hubnote_v2_pipeline_select", async ({ ack, body, options, logger })
   }
 });
 
-// ✅ When a board is selected, store it in private_metadata (ack FIRST)
+// When a board is selected, store it in private_metadata (ack FIRST)
 app.action("board_select", async ({ ack, body, client, logger }) => {
-  await ack(); // MUST be within 3 seconds
+  await ack();
 
   try {
     const selectedBoardId = body?.actions?.[0]?.selected_option?.value || "";
     const view = body?.view;
-
     if (!selectedBoardId || !view?.id) return;
 
     const meta = parsePrivateMetadata(view.private_metadata);
     meta.boardId = selectedBoardId;
 
     const cleanView = buildCleanViewPayload(view, JSON.stringify(meta));
-
     await client.views.update({
       view_id: view.id,
       hash: view.hash,
@@ -366,10 +428,7 @@ app.options("group_select", async ({ body, options, ack, logger }) => {
       return await ack({
         options: [
           {
-            text: {
-              type: "plain_text",
-              text: "No groups found for this board",
-            },
+            text: { type: "plain_text", text: "No groups found for this board" },
             value: "NO_GROUPS_FOUND",
           },
         ],
@@ -382,10 +441,7 @@ app.options("group_select", async ({ body, options, ack, logger }) => {
     await ack({
       options: [
         {
-          text: {
-            type: "plain_text",
-            text: "ERROR loading groups (check Render logs)",
-          },
+          text: { type: "plain_text", text: "ERROR loading groups (check Render logs)" },
           value: "ERROR_LOADING_GROUPS",
         },
       ],
@@ -397,7 +453,7 @@ app.options("group_select", async ({ body, options, ack, logger }) => {
 // /cstask SLASH COMMAND -> OPEN MODAL
 // ==============================
 app.command("/cstask", async ({ ack, body, client, logger }) => {
-  await ack(); // Must ack quickly
+  await ack();
 
   try {
     await client.views.open({
@@ -408,7 +464,7 @@ app.command("/cstask", async ({ ack, body, client, logger }) => {
         title: { type: "plain_text", text: "Create CS Task" },
         submit: { type: "plain_text", text: "Create" },
         close: { type: "plain_text", text: "Cancel" },
-        private_metadata: JSON.stringify({}), // we’ll store boardId here
+        private_metadata: JSON.stringify({}), // store boardId here
         blocks: [
           {
             type: "input",
@@ -433,8 +489,6 @@ app.command("/cstask", async ({ ack, body, client, logger }) => {
             label: { type: "plain_text", text: "Task Owner" },
             element: { type: "users_select", action_id: "owner_user_select" },
           },
-
-          // ✅ Dynamic Board (dispatch_action required so app.action("board_select") fires reliably)
           {
             type: "input",
             block_id: "board_block",
@@ -447,8 +501,6 @@ app.command("/cstask", async ({ ack, body, client, logger }) => {
               min_query_length: 0,
             },
           },
-
-          // ✅ Dynamic Group (reads selected board from private_metadata)
           {
             type: "input",
             block_id: "group_block",
@@ -460,7 +512,6 @@ app.command("/cstask", async ({ ack, body, client, logger }) => {
               min_query_length: 0,
             },
           },
-
           {
             type: "input",
             block_id: "status_block",
@@ -498,15 +549,13 @@ app.command("/cstask", async ({ ack, body, client, logger }) => {
 });
 
 // ==============================
-// MODAL SUBMIT -> SEND TO ZAPIER
+// /cstask MODAL SUBMIT -> SEND TO ZAPIER
 // ==============================
 app.view("cstask_modal_submit", async ({ ack, body, view, client, logger }) => {
-  // Validate quickly and ack appropriately
   const taskName =
     view.state.values.task_name_block.task_name_input.value?.trim() || "";
   const description =
-    view.state.values.description_block?.description_input?.value?.trim() ||
-    "";
+    view.state.values.description_block?.description_input?.value?.trim() || "";
 
   const ownerSlackUserId =
     view.state.values.owner_block.owner_user_select.selected_user || "";
@@ -536,9 +585,8 @@ app.view("cstask_modal_submit", async ({ ack, body, view, client, logger }) => {
     return;
   }
 
-  await ack(); // ack before doing slow network work
+  await ack();
 
-  // Owner email lookup (requires users:read + users:read.email + reinstall)
   let taskOwnerEmail = null;
   try {
     const userInfo = await client.users.info({ user: ownerSlackUserId });
@@ -565,7 +613,6 @@ app.view("cstask_modal_submit", async ({ ack, body, view, client, logger }) => {
     return;
   }
 
-  // Send to Zapier
   try {
     await axios.post(
       ZAPIER_WEBHOOK_URL,
@@ -608,31 +655,14 @@ app.view("cstask_modal_submit", async ({ ack, body, view, client, logger }) => {
 });
 
 // ==============================
-// /hubnote — v1 + v2 in one command
-// - Default: v2 dynamic lookups
-// - Run v1 explicitly: /hubnote v1
+// /hubnote — sessions + UI builders
 // ==============================
-//
-// ✅ Slack custom emojis used in ephemeral buttons:
-// ✅ Yes = :meow_nod:
-// ❌ No  = :bear-headshake:
-//
-// ✅ FILE FLOW (unchanged):
-// callback -> ephemeral Yes/No -> if Yes DM -> Attach modal -> Zapier attach webhook
-//
-// NOTE: v2 dynamic lookups require HUBSPOT_PRIVATE_APP_TOKEN
-//
-
-// --------------------------------
-// Shared session store for attachments (unchanged)
-// --------------------------------
 const HUBNOTE_SESSION_TTL_MS = 15 * 60 * 1000; // 15 minutes
 const hubnoteSessions = new Map();
 
 function hubnoteMakeId(prefix = "hn") {
   return `${prefix}_${crypto.randomBytes(12).toString("hex")}`;
 }
-
 function hubnoteSetSession(sessionId, data) {
   hubnoteSessions.set(sessionId, {
     ...data,
@@ -640,7 +670,6 @@ function hubnoteSetSession(sessionId, data) {
     expiresAt: Date.now() + HUBNOTE_SESSION_TTL_MS,
   });
 }
-
 function hubnoteGetSession(sessionId) {
   const s = hubnoteSessions.get(sessionId);
   if (!s) return null;
@@ -650,309 +679,10 @@ function hubnoteGetSession(sessionId) {
   }
   return s;
 }
-
 function hubnoteDeleteSession(sessionId) {
   hubnoteSessions.delete(sessionId);
 }
 
-// --------------------------------
-// v1 UI builders (unchanged from your commit)
-// --------------------------------
-function buildHubnoteModalV1({ correlationId, originChannelId, originUserId }) {
-  return {
-    type: "modal",
-    callback_id: "hubnote_modal_submit_v1",
-    title: { type: "plain_text", text: "HubSpot Note" },
-    submit: { type: "plain_text", text: "Create" },
-    close: { type: "plain_text", text: "Cancel" },
-    private_metadata: JSON.stringify({
-      correlationId,
-      originChannelId,
-      originUserId,
-      version: "v1",
-    }),
-    blocks: [
-      {
-        type: "input",
-        block_id: "record_type_block",
-        label: { type: "plain_text", text: "Record Type" },
-        element: {
-          type: "static_select",
-          action_id: "record_type_select",
-          placeholder: { type: "plain_text", text: "Select record type" },
-          options: [
-            { text: { type: "plain_text", text: "Ticket" }, value: "ticket" },
-            { text: { type: "plain_text", text: "Deal" }, value: "deal" },
-          ],
-        },
-      },
-      {
-        type: "input",
-        block_id: "note_title_block",
-        label: { type: "plain_text", text: "Note Title / Subject" },
-        element: {
-          type: "plain_text_input",
-          action_id: "note_title_input",
-          placeholder: { type: "plain_text", text: "e.g., Call recap" },
-        },
-      },
-      {
-        type: "input",
-        block_id: "note_body_block",
-        label: { type: "plain_text", text: "Note Body" },
-        element: {
-          type: "plain_text_input",
-          action_id: "note_body_input",
-          multiline: true,
-          placeholder: { type: "plain_text", text: "Write your note..." },
-        },
-      },
-      {
-        type: "input",
-        block_id: "record_identifier_block",
-        label: { type: "plain_text", text: "Record Identifier" },
-        hint: {
-          type: "plain_text",
-          text:
-            "v1: Ticket ID/Number OR Deal ID/Name. Use /hubnote v1 to access this form anytime.",
-        },
-        element: {
-          type: "plain_text_input",
-          action_id: "record_identifier_input",
-          placeholder: { type: "plain_text", text: "Paste identifier..." },
-        },
-      },
-    ],
-  };
-}
-
-// --------------------------------
-// v2 (dynamic) HubSpot helpers + cache
-// --------------------------------
-const HS_CACHE_MS = 10 * 60 * 1000; // 10 min
-const hsCache = {
-  pipelines: new Map(), // key: "ticket"|"deal" -> { at, pipelines:[{id,label,stages:[{id,label}]}] }
-};
-
-const HS_TICKET_STAGE_PROP = "hs_pipeline_stage";
-const HS_DEAL_STAGE_PROP = "dealstage";
-const HS_PIPELINE_PROP_DEAL = "pipeline";
-const HS_PIPELINE_PROP_TICKET = "hs_pipeline";
-
-function hsApiObjectType(recordType) {
-  // HubSpot API endpoints use plural object names
-  return recordType === "deal" ? "deals" : "tickets";
-}
-// ==============================
-// HUBSPOT: pipelines + cache helpers (required for v2 dropdowns)
-// ==============================
-
-function hsCacheGetPipelines(recordType) {
-  const key = recordType === "deal" ? "deal" : "ticket";
-  const cached = hsCache.pipelines.get(key);
-  if (!cached) return null;
-  if (Date.now() - cached.at > HS_CACHE_MS) return null;
-  return cached.pipelines || null;
-}
-
-function hsCacheSetPipelines(recordType, pipelines) {
-  const key = recordType === "deal" ? "deal" : "ticket";
-  hsCache.pipelines.set(key, { at: Date.now(), pipelines: pipelines || [] });
-}
-
-function hsPipelineLabel(p) {
-  return p?.label || p?.displayName || p?.name || `Pipeline ${p?.id || ""}`.trim();
-}
-
-function hsStageLabel(s) {
-  return s?.label || s?.displayName || s?.name || `Stage ${s?.id || ""}`.trim();
-}
-
-// Fetch pipelines + stages for Ticket/Deal (cached)
-async function hsGetPipelines(recordType) {
-  const rt = recordType === "deal" ? "deal" : "ticket";
-
-  const cached = hsCacheGetPipelines(rt);
-  if (cached) return cached;
-
-  const objectType = hsApiObjectType(rt); // "deals" or "tickets"
-
-  // HubSpot pipelines endpoint
-  const data = await hubspotRequest("GET", `/crm/v3/pipelines/${objectType}`);
-
-  const results = data?.results || [];
-
-  const pipelines = results.map((p) => {
-    const stages = (p?.stages || []).map((s) => ({
-      id: String(s.id),
-      label: hsStageLabel(s),
-    }));
-
-    return {
-      id: String(p.id),
-      label: hsPipelineLabel(p),
-      stages,
-    };
-  });
-
-  hsCacheSetPipelines(rt, pipelines);
-  return pipelines;
-}
-
-async function hsSearchRecords({ recordType, pipelineId, stageId, query }) {
-  const objectType = hsApiObjectType(recordType);
-
-  const stageProp =
-    recordType === "deal" ? HS_DEAL_STAGE_PROP : HS_TICKET_STAGE_PROP;
-
-  const pipelineProp =
-    recordType === "deal" ? HS_PIPELINE_PROP_DEAL : HS_PIPELINE_PROP_TICKET;
-
-  // Display properties
-  const properties =
-    recordType === "deal"
-      ? ["dealname", pipelineProp, stageProp]
-      : ["subject", pipelineProp, stageProp];
-
-  const body = {
-    filterGroups: [
-      {
-        filters: [
-          {
-            propertyName: pipelineProp,
-            operator: "EQ",
-            value: String(pipelineId),
-          },
-          {
-            propertyName: stageProp,
-            operator: "EQ",
-            value: String(stageId),
-          },
-        ],
-      },
-    ],
-    properties,
-    limit: 50,
-  };
-
-  const q = (query || "").trim();
-  if (q) body.query = q;
-
-  const data = await hubspotRequest(
-    "POST",
-    `/crm/v3/objects/${objectType}/search`,
-    body
-  );
-
-  const results = data?.results || [];
-  return results.map((r) => {
-    const id = String(r.id);
-    const props = r.properties || {};
-    const label =
-      recordType === "deal"
-        ? props.dealname || `Deal ${id}`
-        : props.subject || `Ticket ${id}`;
-    return { id, label };
-  });
-}
-
-// --------------------------------
-// v2 UI builders
-// --------------------------------
-function buildHubnoteModalV2({ correlationId, originChannelId, originUserId }) {
-  return {
-    type: "modal",
-    callback_id: "hubnote_modal_submit_v2",
-    title: { type: "plain_text", text: "HubSpot Note" },
-    submit: { type: "plain_text", text: "Create" },
-    close: { type: "plain_text", text: "Cancel" },
-    private_metadata: JSON.stringify({
-      correlationId,
-      originChannelId,
-      originUserId,
-      version: "v2",
-      recordType: "",
-      pipelineId: "",
-      stageId: "",
-    }),
-    blocks: [
-      {
-        type: "input",
-        block_id: "record_type_block_v2",
-        dispatch_action: true,
-        label: { type: "plain_text", text: "Record Type" },
-        element: {
-          type: "static_select",
-          action_id: "hubnote_v2_record_type_select",
-          placeholder: { type: "plain_text", text: "Ticket or Deal" },
-          options: [
-            { text: { type: "plain_text", text: "Ticket" }, value: "ticket" },
-            { text: { type: "plain_text", text: "Deal" }, value: "deal" },
-          ],
-        },
-      },
-      {
-        type: "input",
-        block_id: "pipeline_block_v2",
-        dispatch_action: true,
-        label: { type: "plain_text", text: "Pipeline" },
-        element: {
-          type: "external_select",
-          action_id: "hubnote_v2_pipeline_select",
-          placeholder: { type: "plain_text", text: "Select a pipeline" },
-          min_query_length: 0,
-        },
-      },
-      {
-        type: "input",
-        block_id: "stage_block_v2",
-        dispatch_action: true,
-        label: { type: "plain_text", text: "Pipeline Stage" },
-        element: {
-          type: "external_select",
-          action_id: "hubnote_v2_stage_select",
-          placeholder: { type: "plain_text", text: "Select a stage" },
-          min_query_length: 0,
-        },
-      },
-      {
-        type: "input",
-        block_id: "record_block_v2",
-        label: { type: "plain_text", text: "Record" },
-        element: {
-          type: "external_select",
-          action_id: "hubnote_v2_record_select",
-          placeholder: { type: "plain_text", text: "Search/select a record" },
-          min_query_length: 0,
-        },
-      },
-      {
-        type: "input",
-        block_id: "note_title_block_v2",
-        label: { type: "plain_text", text: "Note Title / Subject" },
-        element: {
-          type: "plain_text_input",
-          action_id: "hubnote_v2_note_title_input",
-          placeholder: { type: "plain_text", text: "e.g., Call recap" },
-        },
-      },
-      {
-        type: "input",
-        block_id: "note_body_block_v2",
-        label: { type: "plain_text", text: "Note Body" },
-        element: {
-          type: "plain_text_input",
-          action_id: "hubnote_v2_note_body_input",
-          multiline: true,
-          placeholder: { type: "plain_text", text: "Write your note..." },
-        },
-      },
-    ],
-  };
-}
-// --------------------------------
-// Shared ephemeral/DM/file UI builders (unchanged)
-// --------------------------------
 function buildHubnoteAddFilesEphemeral({ sessionId }) {
   return {
     text: "✅ Note created. Add files to the note?",
@@ -1060,54 +790,179 @@ function buildHubnoteAttachModal({ sessionId }) {
   };
 }
 
-// --------------------------------
-// /hubnote slash command
-// - default opens v2
-// - "/hubnote v1" opens v1
-// --------------------------------
+// ------------------------------
+// hubnote v1 modal
+// ------------------------------
+function buildHubnoteModalV1({ correlationId, originChannelId, originUserId }) {
+  return {
+    type: "modal",
+    callback_id: "hubnote_modal_submit_v1",
+    title: { type: "plain_text", text: "HubSpot Note" },
+    submit: { type: "plain_text", text: "Create" },
+    close: { type: "plain_text", text: "Cancel" },
+    private_metadata: JSON.stringify({
+      correlationId,
+      originChannelId,
+      originUserId,
+      version: "v1",
+    }),
+    blocks: [
+      {
+        type: "input",
+        block_id: "record_type_block",
+        label: { type: "plain_text", text: "Record Type" },
+        element: {
+          type: "static_select",
+          action_id: "record_type_select",
+          placeholder: { type: "plain_text", text: "Select record type" },
+          options: [
+            { text: { type: "plain_text", text: "Ticket" }, value: "ticket" },
+            { text: { type: "plain_text", text: "Deal" }, value: "deal" },
+          ],
+        },
+      },
+      {
+        type: "input",
+        block_id: "note_title_block",
+        label: { type: "plain_text", text: "Note Title / Subject" },
+        element: {
+          type: "plain_text_input",
+          action_id: "note_title_input",
+          placeholder: { type: "plain_text", text: "e.g., Call recap" },
+        },
+      },
+      {
+        type: "input",
+        block_id: "note_body_block",
+        label: { type: "plain_text", text: "Note Body" },
+        element: {
+          type: "plain_text_input",
+          action_id: "note_body_input",
+          multiline: true,
+          placeholder: { type: "plain_text", text: "Write your note..." },
+        },
+      },
+      {
+        type: "input",
+        block_id: "record_identifier_block",
+        label: { type: "plain_text", text: "Record Identifier" },
+        hint: {
+          type: "plain_text",
+          text: "v1: Ticket ID/Number OR Deal ID/Name.",
+        },
+        element: {
+          type: "plain_text_input",
+          action_id: "record_identifier_input",
+          placeholder: { type: "plain_text", text: "Paste identifier..." },
+        },
+      },
+    ],
+  };
+}
+
+// ------------------------------
+// hubnote v2 modal
+// ------------------------------
+function buildHubnoteModalV2({ correlationId, originChannelId, originUserId }) {
+  return {
+    type: "modal",
+    callback_id: "hubnote_modal_submit_v2",
+    title: { type: "plain_text", text: "HubSpot Note" },
+    submit: { type: "plain_text", text: "Create" },
+    close: { type: "plain_text", text: "Cancel" },
+    private_metadata: JSON.stringify({
+      correlationId,
+      originChannelId,
+      originUserId,
+      version: "v2",
+      recordType: "",
+      pipelineId: "",
+      stageId: "",
+    }),
+    blocks: [
+      {
+        type: "input",
+        block_id: "record_type_block_v2",
+        dispatch_action: true,
+        label: { type: "plain_text", text: "Record Type" },
+        element: {
+          type: "static_select",
+          action_id: "hubnote_v2_record_type_select",
+          placeholder: { type: "plain_text", text: "Ticket or Deal" },
+          options: [
+            { text: { type: "plain_text", text: "Ticket" }, value: "ticket" },
+            { text: { type: "plain_text", text: "Deal" }, value: "deal" },
+          ],
+        },
+      },
+      {
+        type: "input",
+        block_id: "pipeline_block_v2",
+        dispatch_action: true,
+        label: { type: "plain_text", text: "Pipeline" },
+        element: {
+          type: "external_select",
+          action_id: "hubnote_v2_pipeline_select",
+          placeholder: { type: "plain_text", text: "Select a pipeline" },
+          min_query_length: 0,
+        },
+      },
+      {
+        type: "input",
+        block_id: "stage_block_v2",
+        dispatch_action: true,
+        label: { type: "plain_text", text: "Pipeline Stage" },
+        element: {
+          type: "external_select",
+          action_id: "hubnote_v2_stage_select",
+          placeholder: { type: "plain_text", text: "Select a stage" },
+          min_query_length: 0,
+        },
+      },
+      {
+        type: "input",
+        block_id: "record_block_v2",
+        label: { type: "plain_text", text: "Record" },
+        element: {
+          type: "external_select",
+          action_id: "hubnote_v2_record_select",
+          placeholder: { type: "plain_text", text: "Search/select a record" },
+          min_query_length: 0,
+        },
+      },
+      {
+        type: "input",
+        block_id: "note_title_block_v2",
+        label: { type: "plain_text", text: "Note Title / Subject" },
+        element: {
+          type: "plain_text_input",
+          action_id: "hubnote_v2_note_title_input",
+          placeholder: { type: "plain_text", text: "e.g., Call recap" },
+        },
+      },
+      {
+        type: "input",
+        block_id: "note_body_block_v2",
+        label: { type: "plain_text", text: "Note Body" },
+        element: {
+          type: "plain_text_input",
+          action_id: "hubnote_v2_note_body_input",
+          multiline: true,
+          placeholder: { type: "plain_text", text: "Write your note..." },
+        },
+      },
+    ],
+  };
+}
+
+// ==============================
+// /hubnote COMMAND -> OPEN v2 MODAL (default to v2)
+// ==============================
 app.command("/hubnote", async ({ ack, body, client, logger }) => {
   await ack();
 
   try {
-    const text = (body.text || "").trim().toLowerCase();
-    const forceV1 = text === "v1";
-
     const correlationId = hubnoteMakeId("hubnote");
-
-    if (forceV1) {
-      await client.views.open({
-        trigger_id: body.trigger_id,
-        view: buildHubnoteModalV1({
-          correlationId,
-          originChannelId: body.channel_id,
-          originUserId: body.user_id,
-        }),
-      });
-      return;
-    }
-
-    // Default: v2
-    if (!HUBSPOT_PRIVATE_APP_TOKEN) {
-      // If v2 can’t run, fall back gracefully to v1 (still functional)
-      await client.chat.postEphemeral({
-        channel: body.channel_id,
-        user: body.user_id,
-        text:
-          "⚠️ HUBSPOT_PRIVATE_APP_TOKEN is not configured, so dynamic lookups (v2) can’t load.\n" +
-          "Opening the v1 form instead. (You can also run `/hubnote v1`.)",
-      });
-
-      await client.views.open({
-        trigger_id: body.trigger_id,
-        view: buildHubnoteModalV1({
-          correlationId,
-          originChannelId: body.channel_id,
-          originUserId: body.user_id,
-        }),
-      });
-      return;
-    }
-
     await client.views.open({
       trigger_id: body.trigger_id,
       view: buildHubnoteModalV2({
@@ -1127,119 +982,27 @@ app.command("/hubnote", async ({ ack, body, client, logger }) => {
   }
 });
 
-// --------------------------------
-// v1 submit handler (unchanged behavior; callback flow unchanged)
-// --------------------------------
-app.view("hubnote_modal_submit_v1", async ({ ack, body, view, client, logger }) => {
-  const meta = parsePrivateMetadata(view.private_metadata);
-  const correlationId = meta.correlationId || hubnoteMakeId("hubnote");
-  const originChannelId = meta.originChannelId || body.user.id;
-  const originUserId = meta.originUserId || body.user.id;
-
-  const recordType =
-    view.state.values.record_type_block.record_type_select.selected_option?.value || "";
-
-  const noteTitle =
-    view.state.values.note_title_block.note_title_input.value?.trim() || "";
-
-  const noteBody =
-    view.state.values.note_body_block.note_body_input.value?.trim() || "";
-
-  const recordIdentifier =
-    view.state.values.record_identifier_block.record_identifier_input.value?.trim() || "";
-
-  const errors = {};
-  if (!recordType) errors["record_type_block"] = "Please choose Ticket or Deal.";
-  if (!noteTitle) errors["note_title_block"] = "Note title is required.";
-  if (!noteBody) errors["note_body_block"] = "Note body is required.";
-  if (!recordIdentifier) errors["record_identifier_block"] = "Record identifier is required.";
-
-  if (Object.keys(errors).length) {
-    await ack({ response_action: "errors", errors });
-    return;
-  }
-
+// ==============================
+// hubnote v2 dispatch_action handlers (store selections in private_metadata)
+// ==============================
+app.action("hubnote_v2_record_type_select", async ({ ack, body, client, logger }) => {
   await ack();
 
-  if (!ZAPIER_HUBNOTE_WEBHOOK_URL) {
-    await client.chat.postMessage({
-      channel: body.user.id,
-      text: "❌ ZAPIER_HUBNOTE_WEBHOOK_URL is missing. Add it in Render env vars and redeploy.",
-    });
-    return;
-  }
-
   try {
-    await axios.post(
-      ZAPIER_HUBNOTE_WEBHOOK_URL,
-      {
-        source: "slack",
-        command_name: "hubnote",
-        version: "v1",
-        correlation_id: correlationId,
-        hubspot_object_type: recordType, // "ticket" | "deal"
-        hubspot_record_identifier: recordIdentifier, // v1 text input
-        note_title: noteTitle,
-        note_body: noteBody,
-        submitted_by_slack_user_id: body.user.id,
-        submitted_at: new Date().toISOString(),
-        origin_channel_id: originChannelId,
-        origin_user_id: originUserId,
-      },
-      { headers: { "Content-Type": "application/json" }, timeout: 10000 }
-    );
-
-    await client.chat.postEphemeral({
-      channel: originChannelId,
-      user: originUserId,
-      text: "⏳ Creating note in HubSpot…",
-    });
-  } catch (e) {
-    logger.error(e);
-    await client.chat.postEphemeral({
-      channel: originChannelId,
-      user: originUserId,
-      text: "❌ I couldn’t send the note to Zapier. Check Zapier + Render logs and try again.",
-    });
-  }
-});
-
-// --------------------------------
-// v2 action handlers to store selections into private_metadata
-// (reuses your buildCleanViewPayload helper)
-// --------------------------------
-async function hubnoteV2UpdateMeta({ body, client, logger, patch }) {
-  try {
-    const view = body?.view;
-    if (!view?.id) return;
+    const view = body.view;
+    const selected = body?.actions?.[0]?.selected_option?.value || "";
+    if (!view?.id || !selected) return;
 
     const meta = parsePrivateMetadata(view.private_metadata);
-    Object.assign(meta, patch);
+    meta.recordType = selected;
+    meta.pipelineId = ""; // clear downstream
+    meta.stageId = "";
 
     const cleanView = buildCleanViewPayload(view, JSON.stringify(meta));
-
     await client.views.update({
       view_id: view.id,
       hash: view.hash,
       view: cleanView,
-    });
-  } catch (e) {
-    logger.error(e);
-  }
-}
-
-app.action("hubnote_v2_record_type_select", async ({ ack, body, client, logger }) => {
-  await ack();
-  try {
-    const recordType = body?.actions?.[0]?.selected_option?.value || "";
-    if (!recordType) return;
-
-    // clear downstream dependencies when type changes
-    await hubnoteV2UpdateMeta({
-      body,
-      client,
-      logger,
-      patch: { recordType, pipelineId: "", stageId: "" },
     });
   } catch (e) {
     logger.error(e);
@@ -1249,15 +1012,19 @@ app.action("hubnote_v2_record_type_select", async ({ ack, body, client, logger }
 app.action("hubnote_v2_pipeline_select", async ({ ack, body, client, logger }) => {
   await ack();
   try {
+    const view = body.view;
     const pipelineId = body?.actions?.[0]?.selected_option?.value || "";
-    if (!pipelineId) return;
+    if (!view?.id || !pipelineId) return;
 
-    // clear stage when pipeline changes
-    await hubnoteV2UpdateMeta({
-      body,
-      client,
-      logger,
-      patch: { pipelineId, stageId: "" },
+    const meta = parsePrivateMetadata(view.private_metadata);
+    meta.pipelineId = pipelineId;
+    meta.stageId = ""; // clear downstream
+
+    const cleanView = buildCleanViewPayload(view, JSON.stringify(meta));
+    await client.views.update({
+      view_id: view.id,
+      hash: view.hash,
+      view: cleanView,
     });
   } catch (e) {
     logger.error(e);
@@ -1267,54 +1034,53 @@ app.action("hubnote_v2_pipeline_select", async ({ ack, body, client, logger }) =
 app.action("hubnote_v2_stage_select", async ({ ack, body, client, logger }) => {
   await ack();
   try {
+    const view = body.view;
     const stageId = body?.actions?.[0]?.selected_option?.value || "";
-    if (!stageId) return;
+    if (!view?.id || !stageId) return;
 
-    await hubnoteV2UpdateMeta({
-      body,
-      client,
-      logger,
-      patch: { stageId },
+    const meta = parsePrivateMetadata(view.private_metadata);
+    meta.stageId = stageId;
+
+    const cleanView = buildCleanViewPayload(view, JSON.stringify(meta));
+    await client.views.update({
+      view_id: view.id,
+      hash: view.hash,
+      view: cleanView,
     });
   } catch (e) {
     logger.error(e);
   }
 });
 
-// --------------------------------
-// v2 options loaders (external_select)
-// --------------------------------
+// ==============================
+// hubnote v2 options loaders
+// ==============================
 app.options("hubnote_v2_pipeline_select", async ({ ack, body, options, logger }) => {
   try {
     const meta = parsePrivateMetadata(body?.view?.private_metadata);
-    const recordType = meta.recordType || "";
-
-    if (!recordType) {
-      return await ack({
-        options: [
-          { text: { type: "plain_text", text: "Select Record Type first" }, value: "SELECT_RECORD_TYPE_FIRST" },
-        ],
-      });
-    }
-
-    const pipelines = await hsGetPipelines(recordType);
+    const recordType = meta.recordType || "ticket";
     const q = (options?.value || "").trim().toLowerCase();
 
-    const out = pipelines
-      .filter((p) => !q || (p.label || "").toLowerCase().includes(q))
+    const pipelines = await hsGetPipelines(recordType);
+    const opts = (pipelines || [])
+      .filter((p) => !q || String(p.label || "").toLowerCase().includes(q))
       .slice(0, 100)
       .map((p) => ({
-        text: { type: "plain_text", text: p.label.slice(0, 75) },
+        text: { type: "plain_text", text: String(p.label || "Unnamed pipeline").slice(0, 75) },
         value: String(p.id),
       }));
 
-    await ack({
-      options: out.length ? out : [{ text: { type: "plain_text", text: "No pipelines found" }, value: "NO_PIPELINES" }],
-    });
+    if (!opts.length) {
+      return await ack({
+        options: [{ text: { type: "plain_text", text: "No pipelines found" }, value: "NO_PIPELINES_FOUND" }],
+      });
+    }
+
+    await ack({ options: opts });
   } catch (e) {
     logger.error(e);
     await ack({
-      options: [{ text: { type: "plain_text", text: "ERROR loading pipelines (check logs)" }, value: "ERR_PIPELINES" }],
+      options: [{ text: { type: "plain_text", text: "ERROR loading pipelines (check logs)" }, value: "ERROR_LOADING_PIPELINES" }],
     });
   }
 });
@@ -1322,41 +1088,39 @@ app.options("hubnote_v2_pipeline_select", async ({ ack, body, options, logger })
 app.options("hubnote_v2_stage_select", async ({ ack, body, options, logger }) => {
   try {
     const meta = parsePrivateMetadata(body?.view?.private_metadata);
-    const recordType = meta.recordType || "";
+    const recordType = meta.recordType || "ticket";
     const pipelineId = meta.pipelineId || "";
+    const q = (options?.value || "").trim().toLowerCase();
 
-    if (!recordType) {
-      return await ack({
-        options: [{ text: { type: "plain_text", text: "Select Record Type first" }, value: "SELECT_RECORD_TYPE_FIRST" }],
-      });
-    }
     if (!pipelineId) {
       return await ack({
-        options: [{ text: { type: "plain_text", text: "Select a Pipeline first" }, value: "SELECT_PIPELINE_FIRST" }],
+        options: [{ text: { type: "plain_text", text: "Select a pipeline first" }, value: "SELECT_PIPELINE_FIRST" }],
       });
     }
 
     const pipelines = await hsGetPipelines(recordType);
-    const pipeline = pipelines.find((p) => p.id === String(pipelineId));
+    const pipeline = (pipelines || []).find((p) => String(p.id) === String(pipelineId));
+
     const stages = pipeline?.stages || [];
-
-    const q = (options?.value || "").trim().toLowerCase();
-
-    const out = stages
-      .filter((s) => !q || (s.label || "").toLowerCase().includes(q))
+    const opts = stages
+      .filter((s) => !q || String(s.label || "").toLowerCase().includes(q))
       .slice(0, 100)
       .map((s) => ({
-        text: { type: "plain_text", text: s.label.slice(0, 75) },
+        text: { type: "plain_text", text: String(s.label || "Unnamed stage").slice(0, 75) },
         value: String(s.id),
       }));
 
-    await ack({
-      options: out.length ? out : [{ text: { type: "plain_text", text: "No stages found" }, value: "NO_STAGES" }],
-    });
+    if (!opts.length) {
+      return await ack({
+        options: [{ text: { type: "plain_text", text: "No stages found" }, value: "NO_STAGES_FOUND" }],
+      });
+    }
+
+    await ack({ options: opts });
   } catch (e) {
     logger.error(e);
     await ack({
-      options: [{ text: { type: "plain_text", text: "ERROR loading stages (check logs)" }, value: "ERR_STAGES" }],
+      options: [{ text: { type: "plain_text", text: "ERROR loading stages (check logs)" }, value: "ERROR_LOADING_STAGES" }],
     });
   }
 });
@@ -1364,66 +1128,83 @@ app.options("hubnote_v2_stage_select", async ({ ack, body, options, logger }) =>
 app.options("hubnote_v2_record_select", async ({ ack, body, options, logger }) => {
   try {
     const meta = parsePrivateMetadata(body?.view?.private_metadata);
-    const recordType = meta.recordType || "";
+    const recordType = meta.recordType || "ticket";
     const pipelineId = meta.pipelineId || "";
     const stageId = meta.stageId || "";
+    const q = options?.value || "";
 
-    if (!recordType) {
-      return await ack({
-        options: [{ text: { type: "plain_text", text: "Select Record Type first" }, value: "SELECT_RECORD_TYPE_FIRST" }],
-      });
-    }
     if (!pipelineId) {
       return await ack({
-        options: [{ text: { type: "plain_text", text: "Select a Pipeline first" }, value: "SELECT_PIPELINE_FIRST" }],
+        options: [{ text: { type: "plain_text", text: "Select a pipeline first" }, value: "SELECT_PIPELINE_FIRST" }],
       });
     }
     if (!stageId) {
       return await ack({
-        options: [{ text: { type: "plain_text", text: "Select a Stage first" }, value: "SELECT_STAGE_FIRST" }],
+        options: [{ text: { type: "plain_text", text: "Select a stage first" }, value: "SELECT_STAGE_FIRST" }],
       });
     }
 
-    const q = options?.value || "";
-    const records = await hsSearchRecords({ recordType, pipelineId, stageId, query: q });
-
-    const out = records.slice(0, 100).map((r) => ({
-      text: { type: "plain_text", text: r.label.slice(0, 75) },
-      value: String(r.id),
-    }));
-
-    await ack({
-      options: out.length ? out : [{ text: { type: "plain_text", text: "No records found" }, value: "NO_RECORDS" }],
+    const records = await hsSearchRecords({
+      recordType,
+      pipelineId,
+      stageId,
+      query: q,
     });
+
+    const opts = (records || [])
+      .slice(0, 100)
+      .map((r) => ({
+        text: { type: "plain_text", text: String(r.label || `Record ${r.id}`).slice(0, 75) },
+        value: String(r.id),
+      }));
+
+    if (!opts.length) {
+      return await ack({
+        options: [{ text: { type: "plain_text", text: "No records found" }, value: "NO_RECORDS_FOUND" }],
+      });
+    }
+
+    await ack({ options: opts });
   } catch (e) {
     logger.error(e);
     await ack({
-      options: [{ text: { type: "plain_text", text: "ERROR loading records (check logs)" }, value: "ERR_RECORDS" }],
+      options: [{ text: { type: "plain_text", text: "ERROR loading records (check logs)" }, value: "ERROR_LOADING_RECORDS" }],
     });
   }
 });
 
-// --------------------------------
-// v2 submit handler -> Zapier (resolved record id)
-// --------------------------------
+// ==============================
+// hubnote v2 modal submit -> send to Zapier
+// ==============================
 app.view("hubnote_modal_submit_v2", async ({ ack, body, view, client, logger }) => {
   const meta = parsePrivateMetadata(view.private_metadata);
   const correlationId = meta.correlationId || hubnoteMakeId("hubnote");
   const originChannelId = meta.originChannelId || body.user.id;
   const originUserId = meta.originUserId || body.user.id;
 
-  const recordType = meta.recordType || "";
-  const pipelineId = meta.pipelineId || "";
-  const stageId = meta.stageId || "";
+  const recordType =
+    view.state.values.record_type_block_v2?.hubnote_v2_record_type_select?.selected_option?.value ||
+    meta.recordType ||
+    "";
+
+  const pipelineId =
+    view.state.values.pipeline_block_v2?.hubnote_v2_pipeline_select?.selected_option?.value ||
+    meta.pipelineId ||
+    "";
+
+  const stageId =
+    view.state.values.stage_block_v2?.hubnote_v2_stage_select?.selected_option?.value ||
+    meta.stageId ||
+    "";
 
   const recordId =
-    view.state.values.record_block_v2.hubnote_v2_record_select.selected_option?.value || "";
+    view.state.values.record_block_v2?.hubnote_v2_record_select?.selected_option?.value || "";
 
   const noteTitle =
-    view.state.values.note_title_block_v2.hubnote_v2_note_title_input.value?.trim() || "";
+    view.state.values.note_title_block_v2?.hubnote_v2_note_title_input?.value?.trim() || "";
 
   const noteBody =
-    view.state.values.note_body_block_v2.hubnote_v2_note_body_input.value?.trim() || "";
+    view.state.values.note_body_block_v2?.hubnote_v2_note_body_input?.value?.trim() || "";
 
   const errors = {};
   if (!recordType) errors["record_type_block_v2"] = "Select Ticket or Deal.";
@@ -1457,9 +1238,9 @@ app.view("hubnote_modal_submit_v2", async ({ ack, body, view, client, logger }) 
         version: "v2",
         correlation_id: correlationId,
         hubspot_object_type: recordType, // "ticket" | "deal"
-        hubspot_object_id: recordId,     // ✅ resolved
-        hubspot_pipeline_id: pipelineId,
-        hubspot_stage_id: stageId,
+        hubspot_object_id: String(recordId),
+        hubspot_pipeline_id: String(pipelineId),
+        hubspot_stage_id: String(stageId),
         note_title: noteTitle,
         note_body: noteBody,
         submitted_by_slack_user_id: body.user.id,
@@ -1485,10 +1266,9 @@ app.view("hubnote_modal_submit_v2", async ({ ack, body, view, client, logger }) 
   }
 });
 
-// --------------------------------
+// ==============================
 // Zapier -> SyllaBot callback (note created) -> ephemeral Yes/No in origin
-// (unchanged; works for both v1 and v2)
-// --------------------------------
+// ==============================
 receiver.app.post("/zapier/hubnote/callback", express.json(), async (req, res) => {
   try {
     if (ZAPIER_HUBNOTE_SECRET) {
@@ -1532,7 +1312,7 @@ receiver.app.post("/zapier/hubnote/callback", express.json(), async (req, res) =
       hubspotObjectId: hubspot_object_id ? String(hubspot_object_id) : "",
       originChannelId: origin_channel_id,
       originUserId: origin_user_id,
-      dmChannelId: "", // filled when user clicks YES
+      dmChannelId: "",
     });
 
     await app.client.chat.postEphemeral({
@@ -1548,19 +1328,17 @@ receiver.app.post("/zapier/hubnote/callback", express.json(), async (req, res) =
   }
 });
 
-// --------------------------------
-// Ephemeral button handlers: YES/NO (unchanged)
-// --------------------------------
+// ==============================
+// Ephemeral button handlers: YES/NO
+// ==============================
 app.action("hubnote_add_files_no", async ({ ack, body, client, logger }) => {
   await ack();
-
   try {
     const sessionId = body?.actions?.[0]?.value || "";
     if (sessionId) hubnoteDeleteSession(sessionId);
 
     const channelId = body?.channel?.id;
     const userId = body?.user?.id;
-
     if (channelId && userId) {
       await client.chat.postEphemeral({
         channel: channelId,
@@ -1622,16 +1400,12 @@ app.action("hubnote_add_files_yes", async ({ ack, body, client, logger }) => {
   }
 });
 
-// --------------------------------
-// DM button: open Attach Files modal (unchanged)
-// --------------------------------
+// DM button: open Attach Files modal
 app.action("hubnote_open_attach_modal", async ({ ack, body, client, logger }) => {
   await ack();
-
   try {
     const sessionId = body?.actions?.[0]?.value || "";
     const session = hubnoteGetSession(sessionId);
-
     if (!session) return;
 
     await client.views.open({
@@ -1643,22 +1417,16 @@ app.action("hubnote_open_attach_modal", async ({ ack, body, client, logger }) =>
   }
 });
 
-// --------------------------------
-// Options loader for selecting Slack files (unchanged)
-// --------------------------------
+// Options loader for selecting Slack files (requires files:read scope)
 app.options("hubnote_files_select", async ({ ack, body, options, client, logger }) => {
   try {
-    const sessionId =
-      parsePrivateMetadata(body?.view?.private_metadata)?.sessionId || "";
+    const sessionId = parsePrivateMetadata(body?.view?.private_metadata)?.sessionId || "";
     const session = hubnoteGetSession(sessionId);
 
     if (!session) {
       return await ack({
         options: [
-          {
-            text: { type: "plain_text", text: "Session expired — reopen /hubnote" },
-            value: "SESSION_EXPIRED",
-          },
+          { text: { type: "plain_text", text: "Session expired — reopen /hubnote" }, value: "SESSION_EXPIRED" },
         ],
       });
     }
@@ -1671,7 +1439,6 @@ app.options("hubnote_files_select", async ({ ack, body, options, client, logger 
     });
 
     const files = filesRes?.files || [];
-
     const filtered = files
       .filter((f) => {
         const name = (f?.name || "").toLowerCase();
@@ -1690,12 +1457,7 @@ app.options("hubnote_files_select", async ({ ack, body, options, client, logger 
 
     if (!filtered.length) {
       return await ack({
-        options: [
-          {
-            text: { type: "plain_text", text: "No matching files found" },
-            value: "NO_FILES_FOUND",
-          },
-        ],
+        options: [{ text: { type: "plain_text", text: "No matching files found" }, value: "NO_FILES_FOUND" }],
       });
     }
 
@@ -1703,22 +1465,12 @@ app.options("hubnote_files_select", async ({ ack, body, options, client, logger 
   } catch (e) {
     logger.error(e);
     await ack({
-      options: [
-        {
-          text: {
-            type: "plain_text",
-            text: "ERROR loading files (check scopes/logs)",
-          },
-          value: "ERROR_LOADING_FILES",
-        },
-      ],
+      options: [{ text: { type: "plain_text", text: "ERROR loading files (check scopes/logs)" }, value: "ERROR_LOADING_FILES" }],
     });
   }
 });
 
-// --------------------------------
-// Attach modal submit -> forward selected file IDs to Zapier (unchanged)
-// --------------------------------
+// Attach modal submit -> forward selected file IDs (and note ID) to Zapier
 app.view("hubnote_attach_modal_submit", async ({ ack, body, view, client, logger }) => {
   const meta = parsePrivateMetadata(view.private_metadata);
   const sessionId = meta.sessionId || "";
@@ -1735,10 +1487,7 @@ app.view("hubnote_attach_modal_submit", async ({ ack, body, view, client, logger
   const slackFileIds = selected.map((o) => o.value).filter(Boolean);
 
   if (!slackFileIds.length) {
-    await ack({
-      response_action: "errors",
-      errors: { files_select_block: "Select at least one file." },
-    });
+    await ack({ response_action: "errors", errors: { files_select_block: "Select at least one file." } });
     return;
   }
 
@@ -1763,7 +1512,7 @@ app.view("hubnote_attach_modal_submit", async ({ ack, body, view, client, logger
       {
         source: "slack",
         command_name: "hubnote",
-        version: "v1-attach",
+        version: "v2-attach",
         hubspot_note_id: session.hubspotNoteId,
         hubspot_object_type: session.hubspotObjectType,
         hubspot_object_id: session.hubspotObjectId,
@@ -1793,5 +1542,5 @@ app.view("hubnote_attach_modal_submit", async ({ ack, body, view, client, logger
 // ==============================
 (async () => {
   await app.start(process.env.PORT || 3000);
-  console.log("⚡️ SyllaBot is running (cstask + hubnote v1/v2 + attachments)");
+  console.log("⚡️ SyllaBot is running (/cstask + /hubnote v2 + file DM flow)");
 })();
