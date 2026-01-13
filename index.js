@@ -712,46 +712,6 @@ function hsApiObjectType(recordType) {
   return recordType === "deal" ? "deals" : "tickets";
 }
 
-async function hubspotRequest(method, path, data) {
-  if (!HUBSPOT_PRIVATE_APP_TOKEN) {
-    throw new Error("Missing HUBSPOT_PRIVATE_APP_TOKEN");
-  }
-  const res = await axios({
-    method,
-    url: `https://api.hubapi.com${path}`,
-    data,
-    headers: {
-      Authorization: `Bearer ${HUBSPOT_PRIVATE_APP_TOKEN}`,
-      "Content-Type": "application/json",
-    },
-    timeout: 10000,
-  });
-  return res.data;
-}
-
-async function hsGetPipelines(recordType) {
-  const now = Date.now();
-  const cached = hsCache.pipelines.get(recordType);
-  if (cached && cached.pipelines?.length && now - cached.at < HS_CACHE_MS) {
-    return cached.pipelines;
-  }
-
-  const objectType = hsApiObjectType(recordType);
-  const data = await hubspotRequest("GET", `/crm/v3/pipelines/${objectType}`);
-
-  const pipelines = (data?.results || []).map((p) => ({
-    id: String(p.id),
-    label: p.label || String(p.id),
-    stages: (p.stages || []).map((s) => ({
-      id: String(s.id),
-      label: s.label || String(s.id),
-    })),
-  }));
-
-  hsCache.pipelines.set(recordType, { at: now, pipelines });
-  return pipelines;
-}
-
 async function hsSearchRecords({ recordType, pipelineId, stageId, query }) {
   const objectType = hsApiObjectType(recordType);
 
@@ -780,6 +740,26 @@ async function hsSearchRecords({ recordType, pipelineId, stageId, query }) {
     limit: 50,
   };
 
+  const q = (query || "").trim();
+  if (q) body.query = q;
+
+  const data = await hubspotRequest(
+    "POST",
+    `/crm/v3/objects/${objectType}/search`,
+    body
+  );
+
+  const results = data?.results || [];
+  return results.map((r) => {
+    const id = String(r.id);
+    const props = r.properties || {};
+    const label =
+      recordType === "deal"
+        ? props.dealname || `Deal ${id}`
+        : props.subject || `Ticket ${id}`;
+    return { id, label };
+  });
+}
   const q = (query || "").trim();
   if (q) body.query = q;
 
