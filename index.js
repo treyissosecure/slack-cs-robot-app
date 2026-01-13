@@ -1,7 +1,7 @@
 /**
  * index.js — SyllaBot (Slack Bolt + Express) on Render
  *
- * ✅ /cstask remains untouched (verbatim from your commit)
+ * ✅ /cstask remains untouched
  * ✅ /hubnote v1 remains functional (trigger with: /hubnote v1)
  * ✅ /hubnote v2 is now the default (dynamic lookups: Record Type → Pipeline → Stage → Record)
  * ✅ Keeps your split endpoints, metadata helpers, logging style, error handling patterns
