@@ -915,26 +915,28 @@ app.action("hubnote_v2_pipeline_select", async ({ ack, body, client, logger }) =
 
 app.action("hubnote_v2_stage_select", async ({ ack, body, client, logger }) => {
   await ack();
+
   try {
     const view = body.view;
     const stageId = body?.actions?.[0]?.selected_option?.value || "";
     if (!view?.id || !stageId) return;
 
     const meta = parsePrivateMetadata(view.private_metadata);
-    const nextMeta = {
-      ...meta,
-      stageId,
-      depsNonce: String(Number(meta.depsNonce || "0") + 1),
-    };
 
-    const rebuilt = buildHubnoteModalV2({
-      correlationId: nextMeta.correlationId,
-      originChannelId: nextMeta.originChannelId,
-      originUserId: nextMeta.originUserId,
-      metaOverride: nextMeta,
+    // ✅ Just update metadata; do NOT rebuild blocks/nonce
+    meta.stageId = stageId;
+
+    // (Optional but nice) also store labels for debugging / future initial_option work
+    const stageLabel = body?.actions?.[0]?.selected_option?.text?.text || "";
+    if (stageLabel) meta.stageLabel = stageLabel;
+
+    const cleanView = buildCleanViewPayload(view, JSON.stringify(meta));
+
+    await client.views.update({
+      view_id: view.id,
+      hash: view.hash,
+      view: cleanView,
     });
-
-    await client.views.update({ view_id: view.id, hash: view.hash, view: rebuilt });
   } catch (e) {
     logger.error(e);
   }
