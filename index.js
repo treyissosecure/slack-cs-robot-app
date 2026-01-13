@@ -248,9 +248,7 @@ function buildCleanViewPayload(view, privateMetadataString) {
 // ==============================
 
 // Board dropdown options
-app.options("board_select", async ({ options, ack, logger }) => {
-  // For options, ack() IS the response; must be fast.
-  app.options("hubnote_v2_pipeline_select", async ({ ack, body, options, logger }) => {
+app.options("hubnote_v2_pipeline_select", async ({ ack, body, options, logger }) => {
   try {
     const meta = parsePrivateMetadata(body?.view?.private_metadata);
     const recordType = meta.recordType || "ticket";
@@ -258,23 +256,32 @@ app.options("board_select", async ({ options, ack, logger }) => {
 
     const pipelines = await hsGetPipelines(recordType);
 
-    const opts = pipelines
-      .filter((p) => !q || (p.label || "").toLowerCase().includes(q))
+    const opts = (pipelines || [])
+      .filter((p) => !q || String(p.label || "").toLowerCase().includes(q))
       .slice(0, 100)
       .map((p) => ({
-        text: { type: "plain_text", text: p.label.slice(0, 75) },
-        value: p.id,
+        text: { type: "plain_text", text: (String(p.label || "Unnamed pipeline")).slice(0, 75) },
+        value: String(p.id),
       }));
 
     if (!opts.length) {
       return await ack({
         options: [
-          {
-            text: { type: "plain_text", text: "No pipelines found" },
-            value: "NO_PIPELINES_FOUND",
-          },
+          { text: { type: "plain_text", text: "No pipelines found" }, value: "NO_PIPELINES_FOUND" },
         ],
       });
+    }
+
+    await ack({ options: opts });
+  } catch (e) {
+    logger.error(e);
+    await ack({
+      options: [
+        { text: { type: "plain_text", text: "ERROR loading pipelines (check logs)" }, value: "ERROR_LOADING_PIPELINES" },
+      ],
+    });
+  }
+});
 
     await ack({ options: opts });
   } catch (e) {
