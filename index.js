@@ -1,7 +1,42 @@
+/**
+ * index.js — SyllaBot (Slack Bolt + Express) on Render
+ *
+ * ✅ /cstask remains untouched (verbatim from your commit)
+ * ✅ /hubnote v1 remains functional (trigger with: /hubnote v1)
+ * ✅ /hubnote v2 is now the default (dynamic lookups: Record Type → Pipeline → Stage → Record)
+ * ✅ Keeps your split endpoints, metadata helpers, logging style, error handling patterns
+ * ✅ Keeps your existing Hubnote “Add files?” → DM → Attach modal flow intact
+ *
+ * REQUIRED ENV VARS (existing):
+ * - SLACK_SIGNING_SECRET
+ * - SLACK_BOT_TOKEN
+ * - MONDAY_API_TOKEN
+ * - ZAPIER_WEBHOOK_URL (for /cstask)
+ *
+ * REQUIRED ENV VARS (hubnote):
+ * - ZAPIER_HUBNOTE_WEBHOOK_URL (SyllaBot -> Zapier: create note + associate)
+ * - HUBSPOT_PRIVATE_APP_TOKEN (SyllaBot -> HubSpot: dynamic lookups)
+ *
+ * OPTIONAL ENV VARS (hubnote):
+ * - ZAPIER_HUBNOTE_ATTACH_WEBHOOK_URL (SyllaBot -> Zapier: attach files)
+ * - ZAPIER_HUBNOTE_SECRET (Zapier -> SyllaBot callback auth)
+ *
+ * SLACK SCOPES YOU’LL NEED FOR HUBNOTE:
+ * - commands
+ * - chat:write
+ * - im:write (open DM after Yes)
+ * - files:read (file picker)
+ *
+ * HubSpot stage properties (confirmed):
+ * - Tickets: hs_pipeline_stage
+ * - Deals: dealstage
+ */
+
 const { App, ExpressReceiver, LogLevel } = require("@slack/bolt");
 const axios = require("axios");
 const express = require("express");
 const crypto = require("crypto");
+
 // ==============================
 // CONFIG
 // ==============================
@@ -10,6 +45,13 @@ const ZAPIER_WEBHOOK_URL =
   "https://hooks.zapier.com/hooks/catch/25767132/ug29zll/";
 
 const MONDAY_API_TOKEN = process.env.MONDAY_API_TOKEN;
+
+// HubSpot + hubnote config
+const HUBSPOT_PRIVATE_APP_TOKEN = process.env.HUBSPOT_PRIVATE_APP_TOKEN || "";
+const ZAPIER_HUBNOTE_WEBHOOK_URL = process.env.ZAPIER_HUBNOTE_WEBHOOK_URL || "";
+const ZAPIER_HUBNOTE_ATTACH_WEBHOOK_URL =
+  process.env.ZAPIER_HUBNOTE_ATTACH_WEBHOOK_URL || "";
+const ZAPIER_HUBNOTE_SECRET = process.env.ZAPIER_HUBNOTE_SECRET || "";
 
 // Monday labels (must match exactly)
 const STATUS_LABELS = [
@@ -51,7 +93,13 @@ const receiver = new ExpressReceiver({
 
 // Basic request logging (keep while debugging; you can remove later)
 receiver.app.use((req, res, next) => {
-  console.log("[REQ]", req.method, req.originalUrl, "CT:", req.headers["content-type"]);
+  console.log(
+    "[REQ]",
+    req.method,
+    req.originalUrl,
+    "CT:",
+    req.headers["content-type"]
+  );
   next();
 });
 
@@ -223,7 +271,10 @@ app.options("board_select", async ({ options, ack, logger }) => {
     await ack({
       options: [
         {
-          text: { type: "plain_text", text: "ERROR loading boards (check Render logs)" },
+          text: {
+            type: "plain_text",
+            text: "ERROR loading boards (check Render logs)",
+          },
           value: "ERROR_LOADING_BOARDS",
         },
       ],
@@ -243,14 +294,6 @@ app.action("board_select", async ({ ack, body, client, logger }) => {
 
     const meta = parsePrivateMetadata(view.private_metadata);
     meta.boardId = selectedBoardId;
-
-    // Optional: when board changes, you might want to clear the selected group.
-    // Slack will show whatever the user previously selected otherwise.
-    // We can clear it by rebuilding blocks and setting initial_option to null, but Slack doesn't
-    // support "unset selected_option" directly on external_select. So we just rely on re-opening group.
-
-    // Also: clear cached groups for this board? Not needed; cache is per-board and short.
-    // But you CAN clear any "previous board" groups if you want.
 
     const cleanView = buildCleanViewPayload(view, JSON.stringify(meta));
 
@@ -291,7 +334,10 @@ app.options("group_select", async ({ body, options, ack, logger }) => {
       return await ack({
         options: [
           {
-            text: { type: "plain_text", text: "No groups found for this board" },
+            text: {
+              type: "plain_text",
+              text: "No groups found for this board",
+            },
             value: "NO_GROUPS_FOUND",
           },
         ],
@@ -304,7 +350,10 @@ app.options("group_select", async ({ body, options, ack, logger }) => {
     await ack({
       options: [
         {
-          text: { type: "plain_text", text: "ERROR loading groups (check Render logs)" },
+          text: {
+            type: "plain_text",
+            text: "ERROR loading groups (check Render logs)",
+          },
           value: "ERROR_LOADING_GROUPS",
         },
       ],
@@ -424,7 +473,8 @@ app.view("cstask_modal_submit", async ({ ack, body, view, client, logger }) => {
   const taskName =
     view.state.values.task_name_block.task_name_input.value?.trim() || "";
   const description =
-    view.state.values.description_block?.description_input?.value?.trim() || "";
+    view.state.values.description_block?.description_input?.value?.trim() ||
+    "";
 
   const ownerSlackUserId =
     view.state.values.owner_block.owner_user_select.selected_user || "";
@@ -526,36 +576,24 @@ app.view("cstask_modal_submit", async ({ ack, body, view, client, logger }) => {
 });
 
 // ==============================
-// /hubnote (HubSpot Note) — NEW
+// /hubnote — v1 + v2 in one command
+// - Default: v2 dynamic lookups
+// - Run v1 explicitly: /hubnote v1
 // ==============================
 //
-// ENV VARS (add in Render):
-// - ZAPIER_HUBNOTE_WEBHOOK_URL  (SyllaBot -> Zapier for creating note)
-// - ZAPIER_HUBNOTE_ATTACH_WEBHOOK_URL (optional; SyllaBot -> Zapier for attaching files)
-// - ZAPIER_HUBNOTE_SECRET (optional; Zapier -> SyllaBot callback auth)
-//
-// Slack custom emojis used in ephemeral buttons:
+// ✅ Slack custom emojis used in ephemeral buttons:
 // ✅ Yes = :meow_nod:
 // ❌ No  = :bear-headshake:
 //
-// NOTE ABOUT FILES:
-// Slack modals cannot directly upload files. This flow uses:
-// - Ephemeral prompt in origin channel: "Add files? Yes/No"
-// - If Yes: DM is opened and user is guided to upload files there.
-// - Attach modal currently supports selecting Slack file IDs (requires files:read scope)
-//   and forwards file IDs to Zapier. (You can later extend SyllaBot to download the
-//   file bytes and upload to HubSpot directly, which is often the most reliable path.)
+// ✅ FILE FLOW (unchanged):
+// callback -> ephemeral Yes/No -> if Yes DM -> Attach modal -> Zapier attach webhook
+//
+// NOTE: v2 dynamic lookups require HUBSPOT_PRIVATE_APP_TOKEN
+//
 
-const ZAPIER_HUBNOTE_WEBHOOK_URL =
-  process.env.ZAPIER_HUBNOTE_WEBHOOK_URL || "";
-
-const ZAPIER_HUBNOTE_ATTACH_WEBHOOK_URL =
-  process.env.ZAPIER_HUBNOTE_ATTACH_WEBHOOK_URL || "";
-
-const ZAPIER_HUBNOTE_SECRET =
-  process.env.ZAPIER_HUBNOTE_SECRET || "";
-
-// Session store for "Add files?" flow (in-memory; mirrors your cache approach)
+// --------------------------------
+// Shared session store for attachments (unchanged)
+// --------------------------------
 const HUBNOTE_SESSION_TTL_MS = 15 * 60 * 1000; // 15 minutes
 const hubnoteSessions = new Map();
 
@@ -564,7 +602,11 @@ function hubnoteMakeId(prefix = "hn") {
 }
 
 function hubnoteSetSession(sessionId, data) {
-  hubnoteSessions.set(sessionId, { ...data, sessionId, expiresAt: Date.now() + HUBNOTE_SESSION_TTL_MS });
+  hubnoteSessions.set(sessionId, {
+    ...data,
+    sessionId,
+    expiresAt: Date.now() + HUBNOTE_SESSION_TTL_MS,
+  });
 }
 
 function hubnoteGetSession(sessionId) {
@@ -581,13 +623,13 @@ function hubnoteDeleteSession(sessionId) {
   hubnoteSessions.delete(sessionId);
 }
 
-// ------------------------------
-// UI builders
-// ------------------------------
+// --------------------------------
+// v1 UI builders (unchanged from your commit)
+// --------------------------------
 function buildHubnoteModalV1({ correlationId, originChannelId, originUserId }) {
   return {
     type: "modal",
-    callback_id: "hubnote_modal_submit",
+    callback_id: "hubnote_modal_submit_v1",
     title: { type: "plain_text", text: "HubSpot Note" },
     submit: { type: "plain_text", text: "Create" },
     close: { type: "plain_text", text: "Cancel" },
@@ -639,7 +681,8 @@ function buildHubnoteModalV1({ correlationId, originChannelId, originUserId }) {
         label: { type: "plain_text", text: "Record Identifier" },
         hint: {
           type: "plain_text",
-          text: "v1: Ticket ID/Number OR Deal ID/Name. We'll add dynamic lookups next.",
+          text:
+            "v1: Ticket ID/Number OR Deal ID/Name. Use /hubnote v1 to access this form anytime.",
         },
         element: {
           type: "plain_text_input",
@@ -651,6 +694,205 @@ function buildHubnoteModalV1({ correlationId, originChannelId, originUserId }) {
   };
 }
 
+// --------------------------------
+// v2 (dynamic) HubSpot helpers + cache
+// --------------------------------
+const HS_CACHE_MS = 10 * 60 * 1000; // 10 min
+const hsCache = {
+  pipelines: new Map(), // key: "ticket"|"deal" -> { at, pipelines:[{id,label,stages:[{id,label}]}] }
+};
+
+const HS_TICKET_STAGE_PROP = "hs_pipeline_stage";
+const HS_DEAL_STAGE_PROP = "dealstage";
+const HS_PIPELINE_PROP = "pipeline";
+
+function hsApiObjectType(recordType) {
+  // HubSpot API endpoints use plural object names
+  return recordType === "deal" ? "deals" : "tickets";
+}
+
+async function hubspotRequest(method, path, data) {
+  if (!HUBSPOT_PRIVATE_APP_TOKEN) {
+    throw new Error("Missing HUBSPOT_PRIVATE_APP_TOKEN");
+  }
+  const res = await axios({
+    method,
+    url: `https://api.hubapi.com${path}`,
+    data,
+    headers: {
+      Authorization: `Bearer ${HUBSPOT_PRIVATE_APP_TOKEN}`,
+      "Content-Type": "application/json",
+    },
+    timeout: 10000,
+  });
+  return res.data;
+}
+
+async function hsGetPipelines(recordType) {
+  const now = Date.now();
+  const cached = hsCache.pipelines.get(recordType);
+  if (cached && cached.pipelines?.length && now - cached.at < HS_CACHE_MS) {
+    return cached.pipelines;
+  }
+
+  const objectType = hsApiObjectType(recordType);
+  const data = await hubspotRequest("GET", `/crm/v3/pipelines/${objectType}`);
+
+  const pipelines = (data?.results || []).map((p) => ({
+    id: String(p.id),
+    label: p.label || String(p.id),
+    stages: (p.stages || []).map((s) => ({
+      id: String(s.id),
+      label: s.label || String(s.id),
+    })),
+  }));
+
+  hsCache.pipelines.set(recordType, { at: now, pipelines });
+  return pipelines;
+}
+
+async function hsSearchRecords({ recordType, pipelineId, stageId, query }) {
+  const objectType = hsApiObjectType(recordType);
+  const stageProp = recordType === "deal" ? HS_DEAL_STAGE_PROP : HS_TICKET_STAGE_PROP;
+
+  // Display properties
+  const properties =
+    recordType === "deal"
+      ? ["dealname", HS_PIPELINE_PROP, HS_DEAL_STAGE_PROP]
+      : ["subject", HS_PIPELINE_PROP, HS_TICKET_STAGE_PROP];
+
+  const body = {
+    filterGroups: [
+      {
+        filters: [
+          { propertyName: HS_PIPELINE_PROP, operator: "EQ", value: String(pipelineId) },
+          { propertyName: stageProp, operator: "EQ", value: String(stageId) },
+        ],
+      },
+    ],
+    properties,
+    limit: 50,
+  };
+
+  const q = (query || "").trim();
+  if (q) body.query = q;
+
+  const data = await hubspotRequest(
+    "POST",
+    `/crm/v3/objects/${objectType}/search`,
+    body
+  );
+
+  const results = data?.results || [];
+  return results.map((r) => {
+    const id = String(r.id);
+    const props = r.properties || {};
+    const label =
+      recordType === "deal"
+        ? props.dealname || `Deal ${id}`
+        : props.subject || `Ticket ${id}`;
+    return { id, label };
+  });
+}
+
+// --------------------------------
+// v2 UI builders
+// --------------------------------
+function buildHubnoteModalV2({ correlationId, originChannelId, originUserId }) {
+  return {
+    type: "modal",
+    callback_id: "hubnote_modal_submit_v2",
+    title: { type: "plain_text", text: "HubSpot Note" },
+    submit: { type: "plain_text", text: "Create" },
+    close: { type: "plain_text", text: "Cancel" },
+    private_metadata: JSON.stringify({
+      correlationId,
+      originChannelId,
+      originUserId,
+      version: "v2",
+      recordType: "",
+      pipelineId: "",
+      stageId: "",
+    }),
+    blocks: [
+      {
+        type: "input",
+        block_id: "record_type_block_v2",
+        dispatch_action: true,
+        label: { type: "plain_text", text: "Record Type" },
+        element: {
+          type: "static_select",
+          action_id: "hubnote_v2_record_type_select",
+          placeholder: { type: "plain_text", text: "Ticket or Deal" },
+          options: [
+            { text: { type: "plain_text", text: "Ticket" }, value: "ticket" },
+            { text: { type: "plain_text", text: "Deal" }, value: "deal" },
+          ],
+        },
+      },
+      {
+        type: "input",
+        block_id: "pipeline_block_v2",
+        dispatch_action: true,
+        label: { type: "plain_text", text: "Pipeline" },
+        element: {
+          type: "external_select",
+          action_id: "hubnote_v2_pipeline_select",
+          placeholder: { type: "plain_text", text: "Select a pipeline" },
+          min_query_length: 0,
+        },
+      },
+      {
+        type: "input",
+        block_id: "stage_block_v2",
+        dispatch_action: true,
+        label: { type: "plain_text", text: "Pipeline Stage" },
+        element: {
+          type: "external_select",
+          action_id: "hubnote_v2_stage_select",
+          placeholder: { type: "plain_text", text: "Select a stage" },
+          min_query_length: 0,
+        },
+      },
+      {
+        type: "input",
+        block_id: "record_block_v2",
+        label: { type: "plain_text", text: "Record" },
+        element: {
+          type: "external_select",
+          action_id: "hubnote_v2_record_select",
+          placeholder: { type: "plain_text", text: "Search/select a record" },
+          min_query_length: 0,
+        },
+      },
+      {
+        type: "input",
+        block_id: "note_title_block_v2",
+        label: { type: "plain_text", text: "Note Title / Subject" },
+        element: {
+          type: "plain_text_input",
+          action_id: "hubnote_v2_note_title_input",
+          placeholder: { type: "plain_text", text: "e.g., Call recap" },
+        },
+      },
+      {
+        type: "input",
+        block_id: "note_body_block_v2",
+        label: { type: "plain_text", text: "Note Body" },
+        element: {
+          type: "plain_text_input",
+          action_id: "hubnote_v2_note_body_input",
+          multiline: true,
+          placeholder: { type: "plain_text", text: "Write your note..." },
+        },
+      },
+    ],
+  };
+}
+
+// --------------------------------
+// Shared ephemeral/DM/file UI builders (unchanged)
+// --------------------------------
 function buildHubnoteAddFilesEphemeral({ sessionId }) {
   return {
     text: "✅ Note created. Add files to the note?",
@@ -758,17 +1000,57 @@ function buildHubnoteAttachModal({ sessionId }) {
   };
 }
 
-// ------------------------------
-// /hubnote SLASH COMMAND -> OPEN MODAL
-// ------------------------------
+// --------------------------------
+// /hubnote slash command
+// - default opens v2
+// - "/hubnote v1" opens v1
+// --------------------------------
 app.command("/hubnote", async ({ ack, body, client, logger }) => {
   await ack();
 
   try {
+    const text = (body.text || "").trim().toLowerCase();
+    const forceV1 = text === "v1";
+
     const correlationId = hubnoteMakeId("hubnote");
+
+    if (forceV1) {
+      await client.views.open({
+        trigger_id: body.trigger_id,
+        view: buildHubnoteModalV1({
+          correlationId,
+          originChannelId: body.channel_id,
+          originUserId: body.user_id,
+        }),
+      });
+      return;
+    }
+
+    // Default: v2
+    if (!HUBSPOT_PRIVATE_APP_TOKEN) {
+      // If v2 can’t run, fall back gracefully to v1 (still functional)
+      await client.chat.postEphemeral({
+        channel: body.channel_id,
+        user: body.user_id,
+        text:
+          "⚠️ HUBSPOT_PRIVATE_APP_TOKEN is not configured, so dynamic lookups (v2) can’t load.\n" +
+          "Opening the v1 form instead. (You can also run `/hubnote v1`.)",
+      });
+
+      await client.views.open({
+        trigger_id: body.trigger_id,
+        view: buildHubnoteModalV1({
+          correlationId,
+          originChannelId: body.channel_id,
+          originUserId: body.user_id,
+        }),
+      });
+      return;
+    }
+
     await client.views.open({
       trigger_id: body.trigger_id,
-      view: buildHubnoteModalV1({
+      view: buildHubnoteModalV2({
         correlationId,
         originChannelId: body.channel_id,
         originUserId: body.user_id,
@@ -785,10 +1067,10 @@ app.command("/hubnote", async ({ ack, body, client, logger }) => {
   }
 });
 
-// ------------------------------
-// /hubnote MODAL SUBMIT -> SEND TO ZAPIER (create note + associate)
-// ------------------------------
-app.view("hubnote_modal_submit", async ({ ack, body, view, client, logger }) => {
+// --------------------------------
+// v1 submit handler (unchanged behavior; callback flow unchanged)
+// --------------------------------
+app.view("hubnote_modal_submit_v1", async ({ ack, body, view, client, logger }) => {
   const meta = parsePrivateMetadata(view.private_metadata);
   const correlationId = meta.correlationId || hubnoteMakeId("hubnote");
   const originChannelId = meta.originChannelId || body.user.id;
@@ -817,7 +1099,7 @@ app.view("hubnote_modal_submit", async ({ ack, body, view, client, logger }) => 
     return;
   }
 
-  await ack(); // ack before network work
+  await ack();
 
   if (!ZAPIER_HUBNOTE_WEBHOOK_URL) {
     await client.chat.postMessage({
@@ -847,7 +1129,6 @@ app.view("hubnote_modal_submit", async ({ ack, body, view, client, logger }) => 
       { headers: { "Content-Type": "application/json" }, timeout: 10000 }
     );
 
-    // Processing notice; callback will post the "Note created. Add files?" buttons.
     await client.chat.postEphemeral({
       channel: originChannelId,
       user: originUserId,
@@ -863,24 +1144,291 @@ app.view("hubnote_modal_submit", async ({ ack, body, view, client, logger }) => 
   }
 });
 
-// ------------------------------
+// --------------------------------
+// v2 action handlers to store selections into private_metadata
+// (reuses your buildCleanViewPayload helper)
+// --------------------------------
+async function hubnoteV2UpdateMeta({ body, client, logger, patch }) {
+  try {
+    const view = body?.view;
+    if (!view?.id) return;
+
+    const meta = parsePrivateMetadata(view.private_metadata);
+    Object.assign(meta, patch);
+
+    const cleanView = buildCleanViewPayload(view, JSON.stringify(meta));
+
+    await client.views.update({
+      view_id: view.id,
+      hash: view.hash,
+      view: cleanView,
+    });
+  } catch (e) {
+    logger.error(e);
+  }
+}
+
+app.action("hubnote_v2_record_type_select", async ({ ack, body, client, logger }) => {
+  await ack();
+  try {
+    const recordType = body?.actions?.[0]?.selected_option?.value || "";
+    if (!recordType) return;
+
+    // clear downstream dependencies when type changes
+    await hubnoteV2UpdateMeta({
+      body,
+      client,
+      logger,
+      patch: { recordType, pipelineId: "", stageId: "" },
+    });
+  } catch (e) {
+    logger.error(e);
+  }
+});
+
+app.action("hubnote_v2_pipeline_select", async ({ ack, body, client, logger }) => {
+  await ack();
+  try {
+    const pipelineId = body?.actions?.[0]?.selected_option?.value || "";
+    if (!pipelineId) return;
+
+    // clear stage when pipeline changes
+    await hubnoteV2UpdateMeta({
+      body,
+      client,
+      logger,
+      patch: { pipelineId, stageId: "" },
+    });
+  } catch (e) {
+    logger.error(e);
+  }
+});
+
+app.action("hubnote_v2_stage_select", async ({ ack, body, client, logger }) => {
+  await ack();
+  try {
+    const stageId = body?.actions?.[0]?.selected_option?.value || "";
+    if (!stageId) return;
+
+    await hubnoteV2UpdateMeta({
+      body,
+      client,
+      logger,
+      patch: { stageId },
+    });
+  } catch (e) {
+    logger.error(e);
+  }
+});
+
+// --------------------------------
+// v2 options loaders (external_select)
+// --------------------------------
+app.options("hubnote_v2_pipeline_select", async ({ ack, body, options, logger }) => {
+  try {
+    const meta = parsePrivateMetadata(body?.view?.private_metadata);
+    const recordType = meta.recordType || "";
+
+    if (!recordType) {
+      return await ack({
+        options: [
+          { text: { type: "plain_text", text: "Select Record Type first" }, value: "SELECT_RECORD_TYPE_FIRST" },
+        ],
+      });
+    }
+
+    const pipelines = await hsGetPipelines(recordType);
+    const q = (options?.value || "").trim().toLowerCase();
+
+    const out = pipelines
+      .filter((p) => !q || (p.label || "").toLowerCase().includes(q))
+      .slice(0, 100)
+      .map((p) => ({
+        text: { type: "plain_text", text: p.label.slice(0, 75) },
+        value: String(p.id),
+      }));
+
+    await ack({
+      options: out.length ? out : [{ text: { type: "plain_text", text: "No pipelines found" }, value: "NO_PIPELINES" }],
+    });
+  } catch (e) {
+    logger.error(e);
+    await ack({
+      options: [{ text: { type: "plain_text", text: "ERROR loading pipelines (check logs)" }, value: "ERR_PIPELINES" }],
+    });
+  }
+});
+
+app.options("hubnote_v2_stage_select", async ({ ack, body, options, logger }) => {
+  try {
+    const meta = parsePrivateMetadata(body?.view?.private_metadata);
+    const recordType = meta.recordType || "";
+    const pipelineId = meta.pipelineId || "";
+
+    if (!recordType) {
+      return await ack({
+        options: [{ text: { type: "plain_text", text: "Select Record Type first" }, value: "SELECT_RECORD_TYPE_FIRST" }],
+      });
+    }
+    if (!pipelineId) {
+      return await ack({
+        options: [{ text: { type: "plain_text", text: "Select a Pipeline first" }, value: "SELECT_PIPELINE_FIRST" }],
+      });
+    }
+
+    const pipelines = await hsGetPipelines(recordType);
+    const pipeline = pipelines.find((p) => p.id === String(pipelineId));
+    const stages = pipeline?.stages || [];
+
+    const q = (options?.value || "").trim().toLowerCase();
+
+    const out = stages
+      .filter((s) => !q || (s.label || "").toLowerCase().includes(q))
+      .slice(0, 100)
+      .map((s) => ({
+        text: { type: "plain_text", text: s.label.slice(0, 75) },
+        value: String(s.id),
+      }));
+
+    await ack({
+      options: out.length ? out : [{ text: { type: "plain_text", text: "No stages found" }, value: "NO_STAGES" }],
+    });
+  } catch (e) {
+    logger.error(e);
+    await ack({
+      options: [{ text: { type: "plain_text", text: "ERROR loading stages (check logs)" }, value: "ERR_STAGES" }],
+    });
+  }
+});
+
+app.options("hubnote_v2_record_select", async ({ ack, body, options, logger }) => {
+  try {
+    const meta = parsePrivateMetadata(body?.view?.private_metadata);
+    const recordType = meta.recordType || "";
+    const pipelineId = meta.pipelineId || "";
+    const stageId = meta.stageId || "";
+
+    if (!recordType) {
+      return await ack({
+        options: [{ text: { type: "plain_text", text: "Select Record Type first" }, value: "SELECT_RECORD_TYPE_FIRST" }],
+      });
+    }
+    if (!pipelineId) {
+      return await ack({
+        options: [{ text: { type: "plain_text", text: "Select a Pipeline first" }, value: "SELECT_PIPELINE_FIRST" }],
+      });
+    }
+    if (!stageId) {
+      return await ack({
+        options: [{ text: { type: "plain_text", text: "Select a Stage first" }, value: "SELECT_STAGE_FIRST" }],
+      });
+    }
+
+    const q = options?.value || "";
+    const records = await hsSearchRecords({ recordType, pipelineId, stageId, query: q });
+
+    const out = records.slice(0, 100).map((r) => ({
+      text: { type: "plain_text", text: r.label.slice(0, 75) },
+      value: String(r.id),
+    }));
+
+    await ack({
+      options: out.length ? out : [{ text: { type: "plain_text", text: "No records found" }, value: "NO_RECORDS" }],
+    });
+  } catch (e) {
+    logger.error(e);
+    await ack({
+      options: [{ text: { type: "plain_text", text: "ERROR loading records (check logs)" }, value: "ERR_RECORDS" }],
+    });
+  }
+});
+
+// --------------------------------
+// v2 submit handler -> Zapier (resolved record id)
+// --------------------------------
+app.view("hubnote_modal_submit_v2", async ({ ack, body, view, client, logger }) => {
+  const meta = parsePrivateMetadata(view.private_metadata);
+  const correlationId = meta.correlationId || hubnoteMakeId("hubnote");
+  const originChannelId = meta.originChannelId || body.user.id;
+  const originUserId = meta.originUserId || body.user.id;
+
+  const recordType = meta.recordType || "";
+  const pipelineId = meta.pipelineId || "";
+  const stageId = meta.stageId || "";
+
+  const recordId =
+    view.state.values.record_block_v2.hubnote_v2_record_select.selected_option?.value || "";
+
+  const noteTitle =
+    view.state.values.note_title_block_v2.hubnote_v2_note_title_input.value?.trim() || "";
+
+  const noteBody =
+    view.state.values.note_body_block_v2.hubnote_v2_note_body_input.value?.trim() || "";
+
+  const errors = {};
+  if (!recordType) errors["record_type_block_v2"] = "Select Ticket or Deal.";
+  if (!pipelineId) errors["pipeline_block_v2"] = "Select a pipeline.";
+  if (!stageId) errors["stage_block_v2"] = "Select a stage.";
+  if (!recordId) errors["record_block_v2"] = "Select a record.";
+  if (!noteTitle) errors["note_title_block_v2"] = "Note title is required.";
+  if (!noteBody) errors["note_body_block_v2"] = "Note body is required.";
+
+  if (Object.keys(errors).length) {
+    await ack({ response_action: "errors", errors });
+    return;
+  }
+
+  await ack();
+
+  if (!ZAPIER_HUBNOTE_WEBHOOK_URL) {
+    await client.chat.postMessage({
+      channel: body.user.id,
+      text: "❌ ZAPIER_HUBNOTE_WEBHOOK_URL is missing. Add it in Render env vars and redeploy.",
+    });
+    return;
+  }
+
+  try {
+    await axios.post(
+      ZAPIER_HUBNOTE_WEBHOOK_URL,
+      {
+        source: "slack",
+        command_name: "hubnote",
+        version: "v2",
+        correlation_id: correlationId,
+        hubspot_object_type: recordType, // "ticket" | "deal"
+        hubspot_object_id: recordId,     // ✅ resolved
+        hubspot_pipeline_id: pipelineId,
+        hubspot_stage_id: stageId,
+        note_title: noteTitle,
+        note_body: noteBody,
+        submitted_by_slack_user_id: body.user.id,
+        submitted_at: new Date().toISOString(),
+        origin_channel_id: originChannelId,
+        origin_user_id: originUserId,
+      },
+      { headers: { "Content-Type": "application/json" }, timeout: 10000 }
+    );
+
+    await client.chat.postEphemeral({
+      channel: originChannelId,
+      user: originUserId,
+      text: "⏳ Creating note in HubSpot…",
+    });
+  } catch (e) {
+    logger.error(e);
+    await client.chat.postEphemeral({
+      channel: originChannelId,
+      user: originUserId,
+      text: "❌ I couldn’t send the note to Zapier. Check Zapier + Render logs and try again.",
+    });
+  }
+});
+
+// --------------------------------
 // Zapier -> SyllaBot callback (note created) -> ephemeral Yes/No in origin
-// ------------------------------
-// Configure Zapier to POST here AFTER it creates & associates the HubSpot note.
-//
-// Expected body (example):
-// {
-//   "status": "success",
-//   "correlation_id": "hubnote_...",
-//   "hubspot_note_id": "12345",
-//   "hubspot_object_type": "ticket" | "deal",
-//   "hubspot_object_id": "67890",
-//   "origin_channel_id": "C123",
-//   "origin_user_id": "U123"
-// }
-//
-// Optional auth header:
-// x-zapier-secret: <ZAPIER_HUBNOTE_SECRET>
+// (unchanged; works for both v1 and v2)
+// --------------------------------
 receiver.app.post("/zapier/hubnote/callback", express.json(), async (req, res) => {
   try {
     if (ZAPIER_HUBNOTE_SECRET) {
@@ -901,11 +1449,12 @@ receiver.app.post("/zapier/hubnote/callback", express.json(), async (req, res) =
     } = req.body || {};
 
     if (!origin_channel_id || !origin_user_id) {
-      return res.status(400).json({ ok: false, error: "missing origin_channel_id/origin_user_id" });
+      return res
+        .status(400)
+        .json({ ok: false, error: "missing origin_channel_id/origin_user_id" });
     }
 
     if (status !== "success" || !hubspot_note_id) {
-      // Inform user of failure, privately
       await app.client.chat.postEphemeral({
         channel: origin_channel_id,
         user: origin_user_id,
@@ -926,7 +1475,6 @@ receiver.app.post("/zapier/hubnote/callback", express.json(), async (req, res) =
       dmChannelId: "", // filled when user clicks YES
     });
 
-    // Post ephemeral prompt with Yes/No buttons (your custom emojis)
     await app.client.chat.postEphemeral({
       channel: origin_channel_id,
       user: origin_user_id,
@@ -940,9 +1488,9 @@ receiver.app.post("/zapier/hubnote/callback", express.json(), async (req, res) =
   }
 });
 
-// ------------------------------
-// Ephemeral button handlers: YES/NO
-// ------------------------------
+// --------------------------------
+// Ephemeral button handlers: YES/NO (unchanged)
+// --------------------------------
 app.action("hubnote_add_files_no", async ({ ack, body, client, logger }) => {
   await ack();
 
@@ -950,7 +1498,6 @@ app.action("hubnote_add_files_no", async ({ ack, body, client, logger }) => {
     const sessionId = body?.actions?.[0]?.value || "";
     if (sessionId) hubnoteDeleteSession(sessionId);
 
-    // Ephemeral confirmation in the same place the user ran the command
     const channelId = body?.channel?.id;
     const userId = body?.user?.id;
 
@@ -986,7 +1533,6 @@ app.action("hubnote_add_files_yes", async ({ ack, body, client, logger }) => {
       return;
     }
 
-    // Open a DM only now (user opted in)
     const dm = await client.conversations.open({ users: session.originUserId });
     const dmChannelId = dm?.channel?.id;
 
@@ -999,16 +1545,13 @@ app.action("hubnote_add_files_yes", async ({ ack, body, client, logger }) => {
       return;
     }
 
-    // Save DM channel in session
     hubnoteSetSession(sessionId, { ...session, dmChannelId });
 
-    // DM instructions + button to open attach modal
     await client.chat.postMessage({
       channel: dmChannelId,
       ...buildHubnoteDmPrompt({ sessionId }),
     });
 
-    // Ephemeral confirmation in origin
     await client.chat.postEphemeral({
       channel: session.originChannelId,
       user: session.originUserId,
@@ -1019,9 +1562,9 @@ app.action("hubnote_add_files_yes", async ({ ack, body, client, logger }) => {
   }
 });
 
-// ------------------------------
-// DM button: open Attach Files modal
-// ------------------------------
+// --------------------------------
+// DM button: open Attach Files modal (unchanged)
+// --------------------------------
 app.action("hubnote_open_attach_modal", async ({ ack, body, client, logger }) => {
   await ack();
 
@@ -1040,12 +1583,13 @@ app.action("hubnote_open_attach_modal", async ({ ack, body, client, logger }) =>
   }
 });
 
-// ------------------------------
-// Options loader for selecting Slack files (requires files:read scope)
-// ------------------------------
+// --------------------------------
+// Options loader for selecting Slack files (unchanged)
+// --------------------------------
 app.options("hubnote_files_select", async ({ ack, body, options, client, logger }) => {
   try {
-    const sessionId = parsePrivateMetadata(body?.view?.private_metadata)?.sessionId || "";
+    const sessionId =
+      parsePrivateMetadata(body?.view?.private_metadata)?.sessionId || "";
     const session = hubnoteGetSession(sessionId);
 
     if (!session) {
@@ -1061,9 +1605,6 @@ app.options("hubnote_files_select", async ({ ack, body, options, client, logger 
 
     const query = (options?.value || "").trim().toLowerCase();
 
-    // Slack files.list supports user filter; we’ll list recent files for the user.
-    // If you want to filter to only the DM channel, you can later enforce it via events,
-    // but files.list doesn't reliably support channel-only filtering in all cases.
     const filesRes = await client.files.list({
       user: session.originUserId,
       count: 50,
@@ -1104,7 +1645,10 @@ app.options("hubnote_files_select", async ({ ack, body, options, client, logger 
     await ack({
       options: [
         {
-          text: { type: "plain_text", text: "ERROR loading files (check scopes/logs)" },
+          text: {
+            type: "plain_text",
+            text: "ERROR loading files (check scopes/logs)",
+          },
           value: "ERROR_LOADING_FILES",
         },
       ],
@@ -1112,9 +1656,9 @@ app.options("hubnote_files_select", async ({ ack, body, options, client, logger 
   }
 });
 
-// ------------------------------
-// Attach modal submit -> forward selected file IDs (and note ID) to Zapier
-// ------------------------------
+// --------------------------------
+// Attach modal submit -> forward selected file IDs to Zapier (unchanged)
+// --------------------------------
 app.view("hubnote_attach_modal_submit", async ({ ack, body, view, client, logger }) => {
   const meta = parsePrivateMetadata(view.private_metadata);
   const sessionId = meta.sessionId || "";
@@ -1131,7 +1675,10 @@ app.view("hubnote_attach_modal_submit", async ({ ack, body, view, client, logger
   const slackFileIds = selected.map((o) => o.value).filter(Boolean);
 
   if (!slackFileIds.length) {
-    await ack({ response_action: "errors", errors: { files_select_block: "Select at least one file." } });
+    await ack({
+      response_action: "errors",
+      errors: { files_select_block: "Select at least one file." },
+    });
     return;
   }
 
@@ -1141,7 +1688,6 @@ app.view("hubnote_attach_modal_submit", async ({ ack, body, view, client, logger
     view.state.values.attach_note_block?.attach_note_input?.value?.trim() || "";
 
   if (!ZAPIER_HUBNOTE_ATTACH_WEBHOOK_URL) {
-    // For now, notify user; you can implement SyllaBot->HubSpot direct upload later.
     await client.chat.postMessage({
       channel: session.dmChannelId || body.user.id,
       text:
@@ -1173,9 +1719,6 @@ app.view("hubnote_attach_modal_submit", async ({ ack, body, view, client, logger
       channel: session.dmChannelId || body.user.id,
       text: `✅ Attachment request sent! (${slackFileIds.length} file${slackFileIds.length === 1 ? "" : "s"})`,
     });
-
-    // Optionally keep session alive a bit; or clear it
-    // hubnoteDeleteSession(sessionId);
   } catch (e) {
     logger.error(e);
     await client.chat.postMessage({
@@ -1190,5 +1733,5 @@ app.view("hubnote_attach_modal_submit", async ({ ack, body, view, client, logger
 // ==============================
 (async () => {
   await app.start(process.env.PORT || 3000);
-  console.log("⚡️ SyllaBot is running (stable dropdowns + board→group fix)");
+  console.log("⚡️ SyllaBot is running (cstask + hubnote v1/v2 + attachments)");
 })();
