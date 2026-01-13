@@ -704,7 +704,8 @@ const hsCache = {
 
 const HS_TICKET_STAGE_PROP = "hs_pipeline_stage";
 const HS_DEAL_STAGE_PROP = "dealstage";
-const HS_PIPELINE_PROP = "pipeline";
+const HS_PIPELINE_PROP_DEAL = "pipeline";
+const HS_PIPELINE_PROP_TICKET = "hs_pipeline";
 
 function hsApiObjectType(recordType) {
   // HubSpot API endpoints use plural object names
@@ -753,19 +754,24 @@ async function hsGetPipelines(recordType) {
 
 async function hsSearchRecords({ recordType, pipelineId, stageId, query }) {
   const objectType = hsApiObjectType(recordType);
-  const stageProp = recordType === "deal" ? HS_DEAL_STAGE_PROP : HS_TICKET_STAGE_PROP;
+
+  const stageProp =
+    recordType === "deal" ? HS_DEAL_STAGE_PROP : HS_TICKET_STAGE_PROP;
+
+  const pipelineProp =
+    recordType === "deal" ? HS_PIPELINE_PROP_DEAL : HS_PIPELINE_PROP_TICKET;
 
   // Display properties
   const properties =
     recordType === "deal"
-      ? ["dealname", HS_PIPELINE_PROP, HS_DEAL_STAGE_PROP]
-      : ["subject", HS_PIPELINE_PROP, HS_TICKET_STAGE_PROP];
+      ? ["dealname", pipelineProp, stageProp]
+      : ["subject", pipelineProp, stageProp];
 
   const body = {
     filterGroups: [
       {
         filters: [
-          { propertyName: HS_PIPELINE_PROP, operator: "EQ", value: String(pipelineId) },
+          { propertyName: pipelineProp, operator: "EQ", value: String(pipelineId) },
           { propertyName: stageProp, operator: "EQ", value: String(stageId) },
         ],
       },
@@ -773,6 +779,27 @@ async function hsSearchRecords({ recordType, pipelineId, stageId, query }) {
     properties,
     limit: 50,
   };
+
+  const q = (query || "").trim();
+  if (q) body.query = q;
+
+  const data = await hubspotRequest(
+    "POST",
+    `/crm/v3/objects/${objectType}/search`,
+    body
+  );
+
+  const results = data?.results || [];
+  return results.map((r) => {
+    const id = String(r.id);
+    const props = r.properties || {};
+    const label =
+      recordType === "deal"
+        ? props.dealname || `Deal ${id}`
+        : props.subject || `Ticket ${id}`;
+    return { id, label };
+  });
+}
 
   const q = (query || "").trim();
   if (q) body.query = q;
