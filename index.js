@@ -8,15 +8,20 @@ const crypto = require("crypto");
 // ==============================
 const ZAPIER_WEBHOOK_URL =
   process.env.ZAPIER_WEBHOOK_URL ||
-  "https://hooks.zapier.com/hooks/catch/25767132/ug29zll/"; // /cstask
+  "https://hooks.zapier.com/hooks/catch/25767132/ug29zll/";
 
+const MONDAY_API_TOKEN = process.env.MONDAY_API_TOKEN;
+
+// HubSpot private app token (needed for /hubnote v2 dynamic lookups)
+const HUBSPOT_PRIVATE_APP_TOKEN = process.env.HUBSPOT_PRIVATE_APP_TOKEN || "";
+
+// Hubnote Zapier webhooks
 const ZAPIER_HUBNOTE_WEBHOOK_URL = process.env.ZAPIER_HUBNOTE_WEBHOOK_URL || "";
 const ZAPIER_HUBNOTE_ATTACH_WEBHOOK_URL =
   process.env.ZAPIER_HUBNOTE_ATTACH_WEBHOOK_URL || "";
-const ZAPIER_HUBNOTE_SECRET = process.env.ZAPIER_HUBNOTE_SECRET || "";
 
-const MONDAY_API_TOKEN = process.env.MONDAY_API_TOKEN;
-const HUBSPOT_PRIVATE_APP_TOKEN = process.env.HUBSPOT_PRIVATE_APP_TOKEN || "";
+// Optional callback auth header check
+const ZAPIER_HUBNOTE_SECRET = process.env.ZAPIER_HUBNOTE_SECRET || "";
 
 // Monday labels (must match exactly)
 const STATUS_LABELS = [
@@ -80,7 +85,7 @@ const app = new App({
 });
 
 // ==============================
-// HELPERS: metadata
+// HELPERS: metadata + view payload
 // ==============================
 function parsePrivateMetadata(md) {
   try {
@@ -91,7 +96,6 @@ function parsePrivateMetadata(md) {
 }
 
 function buildCleanViewPayload(view, privateMetadataString) {
-  // Slack views.update expects a "view payload" schema (not Slack's returned view object)
   return {
     type: "modal",
     callback_id: view.callback_id,
@@ -105,13 +109,14 @@ function buildCleanViewPayload(view, privateMetadataString) {
   };
 }
 
+// Slack view.state.values structure changes if block_id changes (nonce resets)
+// This helper finds the selected_option value by action_id regardless of block_id.
 function findSelectedOptionValue(viewStateValues, actionId) {
   const blocks = viewStateValues || {};
   for (const blockId of Object.keys(blocks)) {
     const actions = blocks[blockId] || {};
-    if (actions[actionId]?.selected_option?.value) {
-      return actions[actionId].selected_option.value;
-    }
+    const v = actions[actionId]?.selected_option?.value;
+    if (v) return v;
   }
   return "";
 }
@@ -145,7 +150,6 @@ async function fetchBoards(search = "") {
   const now = Date.now();
   const s = (search || "").trim().toLowerCase();
 
-  // Cache only for empty search (when dropdown first opens)
   if (!s && cache.boards.options.length && now - cache.boards.at < CACHE_MS) {
     return cache.boards.options;
   }
@@ -169,10 +173,7 @@ async function fetchBoards(search = "") {
       value: String(b.id),
     }));
 
-  if (!s) {
-    cache.boards = { at: now, options };
-  }
-
+  if (!s) cache.boards = { at: now, options };
   return options;
 }
 
@@ -180,7 +181,6 @@ async function fetchGroups(boardId, search = "") {
   const now = Date.now();
   const s = (search || "").trim().toLowerCase();
 
-  // Cache only for empty search (when dropdown first opens)
   if (!s) {
     const cached = cache.groupsByBoard.get(boardId);
     if (cached && cached.options?.length && now - cached.at < CACHE_MS) {
@@ -210,155 +210,13 @@ async function fetchGroups(boardId, search = "") {
       value: String(g.id),
     }));
 
-  if (!s) {
-    cache.groupsByBoard.set(boardId, { at: now, options });
-  }
-
+  if (!s) cache.groupsByBoard.set(boardId, { at: now, options });
   return options;
 }
 
 // ==============================
-// HUBSPOT HELPERS (for hubnote v2 dropdowns)
+// /cstask dynamic dropdowns
 // ==============================
-const HS_CACHE_MS = 10 * 60 * 1000; // 10 min
-const hsCache = {
-  pipelines: new Map(), // key: "ticket"|"deal" -> { at, pipelines:[{id,label,stages:[{id,label}]}] }
-};
-
-const HS_TICKET_STAGE_PROP = "hs_pipeline_stage";
-const HS_DEAL_STAGE_PROP = "dealstage";
-const HS_PIPELINE_PROP_DEAL = "pipeline";
-const HS_PIPELINE_PROP_TICKET = "hs_pipeline";
-
-function hsApiObjectType(recordType) {
-  // HubSpot API endpoints use plural object names
-  return recordType === "deal" ? "deals" : "tickets";
-}
-
-async function hubspotRequest(method, path, data) {
-  if (!HUBSPOT_PRIVATE_APP_TOKEN) {
-    throw new Error("Missing HUBSPOT_PRIVATE_APP_TOKEN");
-  }
-
-  const url = `https://api.hubapi.com${path}`;
-
-  const res = await axios.request({
-    method,
-    url,
-    data,
-    timeout: 15000,
-    headers: {
-      Authorization: `Bearer ${HUBSPOT_PRIVATE_APP_TOKEN}`,
-      "Content-Type": "application/json",
-    },
-  });
-
-  return res.data;
-}
-
-function hsCacheGetPipelines(recordType) {
-  const key = recordType === "deal" ? "deal" : "ticket";
-  const cached = hsCache.pipelines.get(key);
-  if (!cached) return null;
-  if (Date.now() - cached.at > HS_CACHE_MS) return null;
-  return cached.pipelines || null;
-}
-
-function hsCacheSetPipelines(recordType, pipelines) {
-  const key = recordType === "deal" ? "deal" : "ticket";
-  hsCache.pipelines.set(key, { at: Date.now(), pipelines: pipelines || [] });
-}
-
-function hsPipelineLabel(p) {
-  return (
-    p?.label ||
-    p?.displayName ||
-    p?.name ||
-    `Pipeline ${p?.id || ""}`.trim()
-  );
-}
-
-function hsStageLabel(s) {
-  return s?.label || s?.displayName || s?.name || `Stage ${s?.id || ""}`.trim();
-}
-
-async function hsGetPipelines(recordType) {
-  const rt = recordType === "deal" ? "deal" : "ticket";
-  const cached = hsCacheGetPipelines(rt);
-  if (cached) return cached;
-
-  const objectType = hsApiObjectType(rt); // "deals" or "tickets"
-  const data = await hubspotRequest("GET", `/crm/v3/pipelines/${objectType}`);
-
-  const results = data?.results || [];
-  const pipelines = results.map((p) => {
-    const stages = (p?.stages || []).map((s) => ({
-      id: String(s.id),
-      label: hsStageLabel(s),
-    }));
-
-    return {
-      id: String(p.id),
-      label: hsPipelineLabel(p),
-      stages,
-    };
-  });
-
-  hsCacheSetPipelines(rt, pipelines);
-  return pipelines;
-}
-
-async function hsSearchRecords({ recordType, pipelineId, stageId, query }) {
-  const objectType = hsApiObjectType(recordType);
-
-  const stageProp = recordType === "deal" ? HS_DEAL_STAGE_PROP : HS_TICKET_STAGE_PROP;
-  const pipelineProp =
-    recordType === "deal" ? HS_PIPELINE_PROP_DEAL : HS_PIPELINE_PROP_TICKET;
-
-  const properties =
-    recordType === "deal"
-      ? ["dealname", pipelineProp, stageProp]
-      : ["subject", pipelineProp, stageProp];
-
-  const body = {
-    filterGroups: [
-      {
-        filters: [
-          { propertyName: pipelineProp, operator: "EQ", value: String(pipelineId) },
-          { propertyName: stageProp, operator: "EQ", value: String(stageId) },
-        ],
-      },
-    ],
-    properties,
-    limit: 50,
-  };
-
-  const q = (query || "").trim();
-  if (q) body.query = q;
-
-  const data = await hubspotRequest(
-    "POST",
-    `/crm/v3/objects/${objectType}/search`,
-    body
-  );
-
-  const results = data?.results || [];
-  return results.map((r) => {
-    const id = String(r.id);
-    const props = r.properties || {};
-    const label =
-      recordType === "deal"
-        ? props.dealname || `Deal ${id}`
-        : props.subject || `Ticket ${id}`;
-    return { id, label };
-  });
-}
-
-// ==============================
-// DYNAMIC DROPDOWNS (external_select options)
-// ==============================
-
-// Board dropdown options
 app.options("board_select", async ({ options, ack, logger }) => {
   try {
     const search = options?.value || "";
@@ -366,12 +224,7 @@ app.options("board_select", async ({ options, ack, logger }) => {
 
     if (!boardOptions.length) {
       return await ack({
-        options: [
-          {
-            text: { type: "plain_text", text: "No boards found" },
-            value: "NO_BOARDS_FOUND",
-          },
-        ],
+        options: [{ text: { type: "plain_text", text: "No boards found" }, value: "NO_BOARDS_FOUND" }],
       });
     }
 
@@ -379,17 +232,11 @@ app.options("board_select", async ({ options, ack, logger }) => {
   } catch (e) {
     logger.error(e);
     await ack({
-      options: [
-        {
-          text: { type: "plain_text", text: "ERROR loading boards (check Render logs)" },
-          value: "ERROR_LOADING_BOARDS",
-        },
-      ],
+      options: [{ text: { type: "plain_text", text: "ERROR loading boards (check Render logs)" }, value: "ERROR_LOADING_BOARDS" }],
     });
   }
 });
 
-// When a board is selected, store it in private_metadata (ack FIRST)
 app.action("board_select", async ({ ack, body, client, logger }) => {
   await ack();
 
@@ -402,6 +249,7 @@ app.action("board_select", async ({ ack, body, client, logger }) => {
     meta.boardId = selectedBoardId;
 
     const cleanView = buildCleanViewPayload(view, JSON.stringify(meta));
+
     await client.views.update({
       view_id: view.id,
       hash: view.hash,
@@ -415,7 +263,6 @@ app.action("board_select", async ({ ack, body, client, logger }) => {
   }
 });
 
-// Group dropdown options (reads boardId from private_metadata)
 app.options("group_select", async ({ body, options, ack, logger }) => {
   try {
     const meta = parsePrivateMetadata(body?.view?.private_metadata);
@@ -424,12 +271,7 @@ app.options("group_select", async ({ body, options, ack, logger }) => {
 
     if (!boardId) {
       return await ack({
-        options: [
-          {
-            text: { type: "plain_text", text: "Select a board first" },
-            value: "SELECT_BOARD_FIRST",
-          },
-        ],
+        options: [{ text: { type: "plain_text", text: "Select a board first" }, value: "SELECT_BOARD_FIRST" }],
       });
     }
 
@@ -437,12 +279,7 @@ app.options("group_select", async ({ body, options, ack, logger }) => {
 
     if (!groupOptions.length) {
       return await ack({
-        options: [
-          {
-            text: { type: "plain_text", text: "No groups found for this board" },
-            value: "NO_GROUPS_FOUND",
-          },
-        ],
+        options: [{ text: { type: "plain_text", text: "No groups found for this board" }, value: "NO_GROUPS_FOUND" }],
       });
     }
 
@@ -450,12 +287,7 @@ app.options("group_select", async ({ body, options, ack, logger }) => {
   } catch (e) {
     logger.error(e);
     await ack({
-      options: [
-        {
-          text: { type: "plain_text", text: "ERROR loading groups (check Render logs)" },
-          value: "ERROR_LOADING_GROUPS",
-        },
-      ],
+      options: [{ text: { type: "plain_text", text: "ERROR loading groups (check Render logs)" }, value: "ERROR_LOADING_GROUPS" }],
     });
   }
 });
@@ -475,7 +307,7 @@ app.command("/cstask", async ({ ack, body, client, logger }) => {
         title: { type: "plain_text", text: "Create CS Task" },
         submit: { type: "plain_text", text: "Create" },
         close: { type: "plain_text", text: "Cancel" },
-        private_metadata: JSON.stringify({}), // store boardId here
+        private_metadata: JSON.stringify({}),
         blocks: [
           {
             type: "input",
@@ -488,11 +320,7 @@ app.command("/cstask", async ({ ack, body, client, logger }) => {
             block_id: "description_block",
             optional: true,
             label: { type: "plain_text", text: "Description" },
-            element: {
-              type: "plain_text_input",
-              action_id: "description_input",
-              multiline: true,
-            },
+            element: { type: "plain_text_input", action_id: "description_input", multiline: true },
           },
           {
             type: "input",
@@ -563,25 +391,17 @@ app.command("/cstask", async ({ ack, body, client, logger }) => {
 // /cstask MODAL SUBMIT -> SEND TO ZAPIER
 // ==============================
 app.view("cstask_modal_submit", async ({ ack, body, view, client, logger }) => {
-  const taskName =
-    view.state.values.task_name_block.task_name_input.value?.trim() || "";
-  const description =
-    view.state.values.description_block?.description_input?.value?.trim() || "";
+  const taskName = view.state.values.task_name_block.task_name_input.value?.trim() || "";
+  const description = view.state.values.description_block?.description_input?.value?.trim() || "";
 
-  const ownerSlackUserId =
-    view.state.values.owner_block.owner_user_select.selected_user || "";
+  const ownerSlackUserId = view.state.values.owner_block.owner_user_select.selected_user || "";
 
   const meta = parsePrivateMetadata(view.private_metadata);
   const boardId = meta.boardId || "";
 
-  const groupId =
-    view.state.values.group_block.group_select.selected_option?.value || "";
-
-  const statusLabel =
-    view.state.values.status_block.status_select.selected_option?.value || "";
-
-  const priorityLabel =
-    view.state.values.priority_block.priority_select.selected_option?.value || "";
+  const groupId = view.state.values.group_block.group_select.selected_option?.value || "";
+  const statusLabel = view.state.values.status_block.status_select.selected_option?.value || "";
+  const priorityLabel = view.state.values.priority_block.priority_select.selected_option?.value || "";
 
   const errors = {};
   if (!taskName) errors["task_name_block"] = "Task name is required.";
@@ -665,15 +485,126 @@ app.view("cstask_modal_submit", async ({ ack, body, view, client, logger }) => {
   }
 });
 
-// ==============================
-// /hubnote — sessions + UI builders
-// ==============================
-const HUBNOTE_SESSION_TTL_MS = 15 * 60 * 1000; // 15 minutes
+// ============================================================================
+// /hubnote v2 (dynamic lookups) + file attach flow
+// ============================================================================
+
+// ------------------------------
+// HubSpot request helper
+// ------------------------------
+async function hubspotRequest(method, path, data) {
+  if (!HUBSPOT_PRIVATE_APP_TOKEN) throw new Error("Missing HUBSPOT_PRIVATE_APP_TOKEN");
+
+  const res = await axios({
+    method,
+    url: `https://api.hubapi.com${path}`,
+    headers: {
+      Authorization: `Bearer ${HUBSPOT_PRIVATE_APP_TOKEN}`,
+      "Content-Type": "application/json",
+    },
+    data,
+    timeout: 15000,
+  });
+
+  return res.data;
+}
+
+// ------------------------------
+// HubSpot caching: pipelines + stages
+// ------------------------------
+const HS_CACHE_MS = 10 * 60 * 1000; // 10 min
+const hsCache = {
+  pipelines: new Map(), // key: "ticket"|"deal" -> { at, pipelines:[{id,label,stages:[{id,label}]}] }
+};
+
+const HS_TICKET_STAGE_PROP = "hs_pipeline_stage";
+const HS_DEAL_STAGE_PROP = "dealstage";
+const HS_PIPELINE_PROP_DEAL = "pipeline";
+const HS_PIPELINE_PROP_TICKET = "hs_pipeline";
+
+function hsApiObjectType(recordType) {
+  return recordType === "deal" ? "deals" : "tickets";
+}
+
+async function hsGetPipelines(recordType) {
+  const key = recordType === "deal" ? "deal" : "ticket";
+  const now = Date.now();
+  const cached = hsCache.pipelines.get(key);
+  if (cached && now - cached.at < HS_CACHE_MS) return cached.pipelines;
+
+  const endpoint =
+    recordType === "deal" ? "/crm/v3/pipelines/deals" : "/crm/v3/pipelines/tickets";
+
+  const data = await hubspotRequest("GET", endpoint);
+
+  const pipelines = (data?.results || []).map((p) => ({
+    id: String(p.id),
+    label: p.label || `Pipeline ${p.id}`,
+    stages: (p.stages || []).map((s) => ({
+      id: String(s.id),
+      label: s.label || `Stage ${s.id}`,
+    })),
+  }));
+
+  hsCache.pipelines.set(key, { at: now, pipelines });
+  return pipelines;
+}
+
+async function hsSearchRecords({ recordType, pipelineId, stageId, query }) {
+  const objectType = hsApiObjectType(recordType);
+
+  const stageProp = recordType === "deal" ? HS_DEAL_STAGE_PROP : HS_TICKET_STAGE_PROP;
+  const pipelineProp = recordType === "deal" ? HS_PIPELINE_PROP_DEAL : HS_PIPELINE_PROP_TICKET;
+
+  const properties =
+    recordType === "deal"
+      ? ["dealname", pipelineProp, stageProp]
+      : ["subject", pipelineProp, stageProp];
+
+  const body = {
+    filterGroups: [
+      {
+        filters: [
+          { propertyName: pipelineProp, operator: "EQ", value: String(pipelineId) },
+          { propertyName: stageProp, operator: "EQ", value: String(stageId) },
+        ],
+      },
+    ],
+    properties,
+    limit: 50,
+  };
+
+  const q = (query || "").trim();
+  if (q) body.query = q;
+
+  const data = await hubspotRequest(
+    "POST",
+    `/crm/v3/objects/${objectType}/search`,
+    body
+  );
+
+  const results = data?.results || [];
+  return results.map((r) => {
+    const id = String(r.id);
+    const props = r.properties || {};
+    const label =
+      recordType === "deal"
+        ? props.dealname || `Deal ${id}`
+        : props.subject || `Ticket ${id}`;
+    return { id, label };
+  });
+}
+
+// ------------------------------
+// Session store for file flow
+// ------------------------------
+const HUBNOTE_SESSION_TTL_MS = 15 * 60 * 1000;
 const hubnoteSessions = new Map();
 
 function hubnoteMakeId(prefix = "hn") {
   return `${prefix}_${crypto.randomBytes(12).toString("hex")}`;
 }
+
 function hubnoteSetSession(sessionId, data) {
   hubnoteSessions.set(sessionId, {
     ...data,
@@ -681,6 +612,7 @@ function hubnoteSetSession(sessionId, data) {
     expiresAt: Date.now() + HUBNOTE_SESSION_TTL_MS,
   });
 }
+
 function hubnoteGetSession(sessionId) {
   const s = hubnoteSessions.get(sessionId);
   if (!s) return null;
@@ -690,18 +622,115 @@ function hubnoteGetSession(sessionId) {
   }
   return s;
 }
+
 function hubnoteDeleteSession(sessionId) {
   hubnoteSessions.delete(sessionId);
 }
 
+// ------------------------------
+// v2 modal builder (nonce forces downstream reset)
+// ------------------------------
+function buildHubnoteModalV2({ correlationId, originChannelId, originUserId, metaOverride = {} }) {
+  const meta = {
+    correlationId,
+    originChannelId,
+    originUserId,
+    version: "v2",
+    recordType: "",
+    pipelineId: "",
+    stageId: "",
+    depsNonce: "0",
+    ...metaOverride,
+  };
+
+  const nonce = String(meta.depsNonce || "0");
+
+  return {
+    type: "modal",
+    callback_id: "hubnote_modal_submit_v2",
+    title: { type: "plain_text", text: "HubSpot Note" },
+    submit: { type: "plain_text", text: "Create" },
+    close: { type: "plain_text", text: "Cancel" },
+    private_metadata: JSON.stringify(meta),
+    blocks: [
+      {
+        type: "input",
+        block_id: "record_type_block_v2",
+        dispatch_action: true,
+        label: { type: "plain_text", text: "Record Type" },
+        element: {
+          type: "static_select",
+          action_id: "hubnote_v2_record_type_select",
+          placeholder: { type: "plain_text", text: "Ticket or Deal" },
+          options: [
+            { text: { type: "plain_text", text: "Ticket" }, value: "ticket" },
+            { text: { type: "plain_text", text: "Deal" }, value: "deal" },
+          ],
+        },
+      },
+      {
+        type: "input",
+        block_id: "pipeline_block_v2",
+        dispatch_action: true,
+        label: { type: "plain_text", text: "Pipeline" },
+        element: {
+          type: "external_select",
+          action_id: "hubnote_v2_pipeline_select",
+          placeholder: { type: "plain_text", text: "Select a pipeline" },
+          min_query_length: 0,
+        },
+      },
+      {
+        type: "input",
+        block_id: `stage_block_v2_${nonce}`,
+        dispatch_action: true,
+        label: { type: "plain_text", text: "Pipeline Stage" },
+        element: {
+          type: "external_select",
+          action_id: "hubnote_v2_stage_select",
+          placeholder: { type: "plain_text", text: "Select a stage" },
+          min_query_length: 0,
+        },
+      },
+      {
+        type: "input",
+        block_id: `record_block_v2_${nonce}`,
+        label: { type: "plain_text", text: "Record" },
+        element: {
+          type: "external_select",
+          action_id: "hubnote_v2_record_select",
+          placeholder: { type: "plain_text", text: "Search/select a record" },
+          min_query_length: 0,
+        },
+      },
+      {
+        type: "input",
+        block_id: "note_title_block_v2",
+        label: { type: "plain_text", text: "Note Title / Subject" },
+        element: { type: "plain_text_input", action_id: "hubnote_v2_note_title_input" },
+      },
+      {
+        type: "input",
+        block_id: "note_body_block_v2",
+        label: { type: "plain_text", text: "Note Body" },
+        element: {
+          type: "plain_text_input",
+          action_id: "hubnote_v2_note_body_input",
+          multiline: true,
+        },
+      },
+    ],
+  };
+}
+
+// ------------------------------
+// Ephemeral + DM UI builders
+// ------------------------------
 function buildHubnoteAddFilesEphemeral({ sessionId }) {
   return {
     text: "✅ Note created. Add files to the note?",
     blocks: [
-      {
-        type: "section",
-        text: { type: "mrkdwn", text: "✅ *Note created.* Add files to the note?" },
-      },
+      { type: "section", text: { type: "mrkdwn", text: "✅ *Note created.* Add files to the note?" } },
       {
         type: "actions",
         block_id: "hubnote_add_files_actions",
@@ -790,205 +819,59 @@ function buildHubnoteAttachModal({ sessionId }) {
         optional: true,
         block_id: "attach_note_block",
         label: { type: "plain_text", text: "Optional message" },
-        element: {
-          type: "plain_text_input",
-          action_id: "attach_note_input",
-          multiline: true,
-          placeholder: { type: "plain_text", text: "Anything to add about these attachments?" },
-        },
+        element: { type: "plain_text_input", action_id: "attach_note_input", multiline: true },
       },
     ],
   };
 }
 
 // ------------------------------
-// hubnote v1 modal
+// /hubnote command -> open v2 modal
 // ------------------------------
-function buildHubnoteModalV1({ correlationId, originChannelId, originUserId }) {
-  return {
-    type: "modal",
-    callback_id: "hubnote_modal_submit_v1",
-    title: { type: "plain_text", text: "HubSpot Note" },
-    submit: { type: "plain_text", text: "Create" },
-    close: { type: "plain_text", text: "Cancel" },
-    private_metadata: JSON.stringify({
-      correlationId,
-      originChannelId,
-      originUserId,
-      version: "v1",
-    }),
-    blocks: [
-      {
-        type: "input",
-        block_id: "record_type_block",
-        label: { type: "plain_text", text: "Record Type" },
-        element: {
-          type: "static_select",
-          action_id: "record_type_select",
-          placeholder: { type: "plain_text", text: "Select record type" },
-          options: [
-            { text: { type: "plain_text", text: "Ticket" }, value: "ticket" },
-            { text: { type: "plain_text", text: "Deal" }, value: "deal" },
-          ],
-        },
-      },
-      {
-        type: "input",
-        block_id: "note_title_block",
-        label: { type: "plain_text", text: "Note Title / Subject" },
-        element: {
-          type: "plain_text_input",
-          action_id: "note_title_input",
-          placeholder: { type: "plain_text", text: "e.g., Call recap" },
-        },
-      },
-      {
-        type: "input",
-        block_id: "note_body_block",
-        label: { type: "plain_text", text: "Note Body" },
-        element: {
-          type: "plain_text_input",
-          action_id: "note_body_input",
-          multiline: true,
-          placeholder: { type: "plain_text", text: "Write your note..." },
-        },
-      },
-      {
-        type: "input",
-        block_id: "record_identifier_block",
-        label: { type: "plain_text", text: "Record Identifier" },
-        hint: {
-          type: "plain_text",
-          text: "v1: Ticket ID/Number OR Deal ID/Name.",
-        },
-        element: {
-          type: "plain_text_input",
-          action_id: "record_identifier_input",
-          placeholder: { type: "plain_text", text: "Paste identifier..." },
-        },
-      },
-    ],
-  };
-}
-
-// ------------------------------
-// hubnote v2 modal
-// ------------------------------
-function buildHubnoteModalV2({ correlationId, originChannelId, originUserId }) {
-  return {
-    type: "modal",
-    callback_id: "hubnote_modal_submit_v2",
-    title: { type: "plain_text", text: "HubSpot Note" },
-    submit: { type: "plain_text", text: "Create" },
-    close: { type: "plain_text", text: "Cancel" },
-    private_metadata: JSON.stringify({
-      correlationId,
-      originChannelId,
-      originUserId,
-      version: "v2",
-      recordType: "",
-      pipelineId: "",
-      stageId: "",
-    }),
-    blocks: [
-      {
-        type: "input",
-        block_id: "record_type_block_v2",
-        dispatch_action: true,
-        label: { type: "plain_text", text: "Record Type" },
-        element: {
-          type: "static_select",
-          action_id: "hubnote_v2_record_type_select",
-          placeholder: { type: "plain_text", text: "Ticket or Deal" },
-          options: [
-            { text: { type: "plain_text", text: "Ticket" }, value: "ticket" },
-            { text: { type: "plain_text", text: "Deal" }, value: "deal" },
-          ],
-        },
-      },
-      {
-        type: "input",
-        block_id: "pipeline_block_v2",
-        dispatch_action: true,
-        label: { type: "plain_text", text: "Pipeline" },
-        element: {
-          type: "external_select",
-          action_id: "hubnote_v2_pipeline_select",
-          placeholder: { type: "plain_text", text: "Select a pipeline" },
-          min_query_length: 0,
-        },
-      },
-      {
-        type: "input",
-        block_id: "stage_block_v2",
-        dispatch_action: true,
-        label: { type: "plain_text", text: "Pipeline Stage" },
-        element: {
-          type: "external_select",
-          action_id: "hubnote_v2_stage_select",
-          placeholder: { type: "plain_text", text: "Select a stage" },
-          min_query_length: 0,
-        },
-      },
-      {
-        type: "input",
-        block_id: "record_block_v2",
-        label: { type: "plain_text", text: "Record" },
-        element: {
-          type: "external_select",
-          action_id: "hubnote_v2_record_select",
-          placeholder: { type: "plain_text", text: "Search/select a record" },
-          min_query_length: 0,
-        },
-      },
-      {
-        type: "input",
-        block_id: "note_title_block_v2",
-        label: { type: "plain_text", text: "Note Title / Subject" },
-        element: {
-          type: "plain_text_input",
-          action_id: "hubnote_v2_note_title_input",
-          placeholder: { type: "plain_text", text: "e.g., Call recap" },
-        },
-      },
-      {
-        type: "input",
-        block_id: "note_body_block_v2",
-        label: { type: "plain_text", text: "Note Body" },
-        element: {
-          type: "plain_text_input",
-          action_id: "hubnote_v2_note_body_input",
-          multiline: true,
-          placeholder: { type: "plain_text", text: "Write your note..." },
-        },
-      },
-    ],
-  };
-}
-
-// ==============================
-// /hubnote COMMAND -> OPEN v2 MODAL (default to v2)
-// ==============================
-app.action("hubnote_v2_record_type_select", async ({ ack, body, client, logger }) => {
+app.command("/hubnote", async ({ ack, body, client, logger }) => {
   await ack();
 
   try {
+    const correlationId = hubnoteMakeId("hubnote");
+    await client.views.open({
+      trigger_id: body.trigger_id,
+      view: buildHubnoteModalV2({
+        correlationId,
+        originChannelId: body.channel_id,
+        originUserId: body.user_id,
+        metaOverride: { recordType: "ticket", depsNonce: "0" },
+      }),
+    });
+  } catch (e) {
+    logger.error(e);
+    try {
+      await client.chat.postMessage({
+        channel: body.user_id,
+        text: "❌ I couldn’t open the HubSpot note form. Please try again.",
+      });
+    } catch (_) {}
+  }
+});
+
+// ------------------------------
+// v2 ACTION handlers (store selections + reset downstream using depsNonce)
+// ------------------------------
+app.action("hubnote_v2_record_type_select", async ({ ack, body, client, logger }) => {
+  await ack();
+  try {
     const view = body.view;
-    const selected = body?.actions?.[0]?.selected_option?.value || "";
-    if (!view?.id || !selected) return;
+    const recordType = body?.actions?.[0]?.selected_option?.value || "";
+    if (!view?.id || !recordType) return;
 
     const meta = parsePrivateMetadata(view.private_metadata);
-
-    // reset downstream + bump nonce
     const nextMeta = {
       ...meta,
-      recordType: selected,
+      recordType,
       pipelineId: "",
       stageId: "",
       depsNonce: String(Number(meta.depsNonce || "0") + 1),
     };
 
-    // rebuild modal (preserves title/body blocks, forces stage/record reset)
     const rebuilt = buildHubnoteModalV2({
       correlationId: nextMeta.correlationId,
       originChannelId: nextMeta.originChannelId,
@@ -996,29 +879,20 @@ app.action("hubnote_v2_record_type_select", async ({ ack, body, client, logger }
       metaOverride: nextMeta,
     });
 
-    await client.views.update({
-      view_id: view.id,
-      hash: view.hash,
-      view: rebuilt,
-    });
+    await client.views.update({ view_id: view.id, hash: view.hash, view: rebuilt });
   } catch (e) {
     logger.error(e);
   }
 });
-// ==============================
-// hubnote v2 dispatch_action handlers (store selections in private_metadata)
-// ==============================
+
 app.action("hubnote_v2_pipeline_select", async ({ ack, body, client, logger }) => {
   await ack();
-
   try {
     const view = body.view;
     const pipelineId = body?.actions?.[0]?.selected_option?.value || "";
     if (!view?.id || !pipelineId) return;
 
     const meta = parsePrivateMetadata(view.private_metadata);
-
-    // reset downstream + bump nonce
     const nextMeta = {
       ...meta,
       pipelineId,
@@ -1033,33 +907,7 @@ app.action("hubnote_v2_pipeline_select", async ({ ack, body, client, logger }) =
       metaOverride: nextMeta,
     });
 
-    await client.views.update({
-      view_id: view.id,
-      hash: view.hash,
-      view: rebuilt,
-    });
-  } catch (e) {
-    logger.error(e);
-  }
-});
-
-app.action("hubnote_v2_pipeline_select", async ({ ack, body, client, logger }) => {
-  await ack();
-  try {
-    const view = body.view;
-    const pipelineId = body?.actions?.[0]?.selected_option?.value || "";
-    if (!view?.id || !pipelineId) return;
-
-    const meta = parsePrivateMetadata(view.private_metadata);
-    meta.pipelineId = pipelineId;
-    meta.stageId = ""; // clear downstream
-
-    const cleanView = buildCleanViewPayload(view, JSON.stringify(meta));
-    await client.views.update({
-      view_id: view.id,
-      hash: view.hash,
-      view: cleanView,
-    });
+    await client.views.update({ view_id: view.id, hash: view.hash, view: rebuilt });
   } catch (e) {
     logger.error(e);
   }
@@ -1067,14 +915,12 @@ app.action("hubnote_v2_pipeline_select", async ({ ack, body, client, logger }) =
 
 app.action("hubnote_v2_stage_select", async ({ ack, body, client, logger }) => {
   await ack();
-
   try {
     const view = body.view;
     const stageId = body?.actions?.[0]?.selected_option?.value || "";
     if (!view?.id || !stageId) return;
 
     const meta = parsePrivateMetadata(view.private_metadata);
-
     const nextMeta = {
       ...meta,
       stageId,
@@ -1088,19 +934,15 @@ app.action("hubnote_v2_stage_select", async ({ ack, body, client, logger }) => {
       metaOverride: nextMeta,
     });
 
-    await client.views.update({
-      view_id: view.id,
-      hash: view.hash,
-      view: rebuilt,
-    });
+    await client.views.update({ view_id: view.id, hash: view.hash, view: rebuilt });
   } catch (e) {
     logger.error(e);
   }
 });
 
-// ==============================
-// hubnote v2 options loaders
-// ==============================
+// ------------------------------
+// v2 OPTIONS handlers
+// ------------------------------
 app.options("hubnote_v2_pipeline_select", async ({ ack, body, options, logger }) => {
   try {
     const meta = parsePrivateMetadata(body?.view?.private_metadata);
@@ -1108,26 +950,20 @@ app.options("hubnote_v2_pipeline_select", async ({ ack, body, options, logger })
     const q = (options?.value || "").trim().toLowerCase();
 
     const pipelines = await hsGetPipelines(recordType);
-    const opts = (pipelines || [])
-      .filter((p) => !q || String(p.label || "").toLowerCase().includes(q))
+
+    const opts = pipelines
+      .filter((p) => !q || (p.label || "").toLowerCase().includes(q))
       .slice(0, 100)
-      .map((p) => ({
-        text: { type: "plain_text", text: String(p.label || "Unnamed pipeline").slice(0, 75) },
-        value: String(p.id),
-      }));
+      .map((p) => ({ text: { type: "plain_text", text: p.label.slice(0, 75) }, value: String(p.id) }));
 
     if (!opts.length) {
-      return await ack({
-        options: [{ text: { type: "plain_text", text: "No pipelines found" }, value: "NO_PIPELINES_FOUND" }],
-      });
+      return await ack({ options: [{ text: { type: "plain_text", text: "No pipelines found" }, value: "NO_PIPELINES" }] });
     }
 
     await ack({ options: opts });
   } catch (e) {
     logger.error(e);
-    await ack({
-      options: [{ text: { type: "plain_text", text: "ERROR loading pipelines (check logs)" }, value: "ERROR_LOADING_PIPELINES" }],
-    });
+    await ack({ options: [{ text: { type: "plain_text", text: "ERROR loading pipelines" }, value: "ERROR_PIPELINES" }] });
   }
 });
 
@@ -1139,35 +975,26 @@ app.options("hubnote_v2_stage_select", async ({ ack, body, options, logger }) =>
     const q = (options?.value || "").trim().toLowerCase();
 
     if (!pipelineId) {
-      return await ack({
-        options: [{ text: { type: "plain_text", text: "Select a pipeline first" }, value: "SELECT_PIPELINE_FIRST" }],
-      });
+      return await ack({ options: [{ text: { type: "plain_text", text: "Select a pipeline first" }, value: "SELECT_PIPELINE_FIRST" }] });
     }
 
     const pipelines = await hsGetPipelines(recordType);
-    const pipeline = (pipelines || []).find((p) => String(p.id) === String(pipelineId));
-
+    const pipeline = pipelines.find((p) => String(p.id) === String(pipelineId));
     const stages = pipeline?.stages || [];
+
     const opts = stages
-      .filter((s) => !q || String(s.label || "").toLowerCase().includes(q))
+      .filter((s) => !q || (s.label || "").toLowerCase().includes(q))
       .slice(0, 100)
-      .map((s) => ({
-        text: { type: "plain_text", text: String(s.label || "Unnamed stage").slice(0, 75) },
-        value: String(s.id),
-      }));
+      .map((s) => ({ text: { type: "plain_text", text: s.label.slice(0, 75) }, value: String(s.id) }));
 
     if (!opts.length) {
-      return await ack({
-        options: [{ text: { type: "plain_text", text: "No stages found" }, value: "NO_STAGES_FOUND" }],
-      });
+      return await ack({ options: [{ text: { type: "plain_text", text: "No stages found" }, value: "NO_STAGES" }] });
     }
 
     await ack({ options: opts });
   } catch (e) {
     logger.error(e);
-    await ack({
-      options: [{ text: { type: "plain_text", text: "ERROR loading stages (check logs)" }, value: "ERROR_LOADING_STAGES" }],
-    });
+    await ack({ options: [{ text: { type: "plain_text", text: "ERROR loading stages" }, value: "ERROR_STAGES" }] });
   }
 });
 
@@ -1177,116 +1004,69 @@ app.options("hubnote_v2_record_select", async ({ ack, body, options, logger }) =
     const recordType = meta.recordType || "ticket";
     const pipelineId = meta.pipelineId || "";
     const stageId = meta.stageId || "";
-    const q = options?.value || "";
+    const q = (options?.value || "").trim();
 
     if (!pipelineId) {
-      return await ack({
-        options: [{ text: { type: "plain_text", text: "Select a pipeline first" }, value: "SELECT_PIPELINE_FIRST" }],
-      });
+      return await ack({ options: [{ text: { type: "plain_text", text: "Select a pipeline first" }, value: "SELECT_PIPELINE_FIRST" }] });
     }
     if (!stageId) {
-      return await ack({
-        options: [{ text: { type: "plain_text", text: "Select a stage first" }, value: "SELECT_STAGE_FIRST" }],
-      });
+      return await ack({ options: [{ text: { type: "plain_text", text: "Select a stage first" }, value: "SELECT_STAGE_FIRST" }] });
     }
 
-    const records = await hsSearchRecords({
-      recordType,
-      pipelineId,
-      stageId,
-      query: q,
-    });
+    const records = await hsSearchRecords({ recordType, pipelineId, stageId, query: q });
 
-    const opts = (records || [])
+    const opts = records
       .slice(0, 100)
-      .map((r) => ({
-        text: { type: "plain_text", text: String(r.label || `Record ${r.id}`).slice(0, 75) },
-        value: String(r.id),
-      }));
+      .map((r) => ({ text: { type: "plain_text", text: r.label.slice(0, 75) }, value: String(r.id) }));
 
     if (!opts.length) {
-      return await ack({
-        options: [{ text: { type: "plain_text", text: "No records found" }, value: "NO_RECORDS_FOUND" }],
-      });
+      return await ack({ options: [{ text: { type: "plain_text", text: "No records found" }, value: "NO_RECORDS" }] });
     }
 
     await ack({ options: opts });
   } catch (e) {
     logger.error(e);
-    await ack({
-      options: [{ text: { type: "plain_text", text: "ERROR loading records (check logs)" }, value: "ERROR_LOADING_RECORDS" }],
-    });
+    await ack({ options: [{ text: { type: "plain_text", text: "ERROR loading records" }, value: "ERROR_RECORDS" }] });
   }
 });
 
-// ==============================
-// hubnote v2 modal submit -> send to Zapier
-// ==============================
+// ------------------------------
+// v2 SUBMIT -> Zapier (create note + associate)
+// ------------------------------
 app.view("hubnote_modal_submit_v2", async ({ ack, body, view, client, logger }) => {
   const meta = parsePrivateMetadata(view.private_metadata);
-  const correlationId = meta.correlationId || hubnoteMakeId("hubnote");
-  const originChannelId = meta.originChannelId || body.user.id;
-  const originUserId = meta.originUserId || body.user.id;
 
-  // Pull selects safely even when block_ids change (nonce strategy)
-  const recordTypeFromState = findSelectedOptionValue(view.state.values, "hubnote_v2_record_type_select");
-  const pipelineIdFromState = findSelectedOptionValue(view.state.values, "hubnote_v2_pipeline_select");
-  const stageIdFromState = findSelectedOptionValue(view.state.values, "hubnote_v2_stage_select");
-  const recordId = findSelectedOptionValue(view.state.values, "hubnote_v2_record_select");
+  const recordType = findSelectedOptionValue(view.state.values, "hubnote_v2_record_type_select") || meta.recordType || "";
+  const pipelineId = findSelectedOptionValue(view.state.values, "hubnote_v2_pipeline_select") || meta.pipelineId || "";
+  const stageId = findSelectedOptionValue(view.state.values, "hubnote_v2_stage_select") || meta.stageId || "";
+  const recordId = findSelectedOptionValue(view.state.values, "hubnote_v2_record_select") || "";
 
-  const recordType = recordTypeFromState || meta.recordType || "";
-  const pipelineId = pipelineIdFromState || meta.pipelineId || "";
-  const stageId = stageIdFromState || meta.stageId || "";
-
-  const noteTitle =
-    view.state.values.note_title_block_v2?.hubnote_v2_note_title_input?.value?.trim() || "";
-
-  const noteBody =
-    view.state.values.note_body_block_v2?.hubnote_v2_note_body_input?.value?.trim() || "";
+  const noteTitle = view.state.values.note_title_block_v2?.hubnote_v2_note_title_input?.value?.trim() || "";
+  const noteBody = view.state.values.note_body_block_v2?.hubnote_v2_note_body_input?.value?.trim() || "";
 
   const errors = {};
   if (!recordType) errors["record_type_block_v2"] = "Select Ticket or Deal.";
   if (!pipelineId) errors["pipeline_block_v2"] = "Select a pipeline.";
-  if (!stageId) errors["stage_block_v2_0"] = "Select a stage."; // fallback key (Slack highlights closest)
-  if (!recordId) errors["record_block_v2_0"] = "Select a record.";
   if (!noteTitle) errors["note_title_block_v2"] = "Note title is required.";
   if (!noteBody) errors["note_body_block_v2"] = "Note body is required.";
 
-  // Slack requires exact block_id keys for field-level errors.
-  // Because stage/record block_ids are dynamic (nonce), we "best effort" by:
-  // - using note_title/body fixed ids (works)
-  // - and if stage/record missing, just show a general error message after ack.
-  const hasBlockingErrors = !recordType || !pipelineId || !stageId || !recordId || !noteTitle || !noteBody;
-
-  if (hasBlockingErrors) {
-    // Prefer showing inline errors for fixed blocks; otherwise ack then DM/ephemeral a message
-    const inlineErrors = {};
-    if (!recordType) inlineErrors["record_type_block_v2"] = errors["record_type_block_v2"];
-    if (!pipelineId) inlineErrors["pipeline_block_v2"] = errors["pipeline_block_v2"];
-    if (!noteTitle) inlineErrors["note_title_block_v2"] = errors["note_title_block_v2"];
-    if (!noteBody) inlineErrors["note_body_block_v2"] = errors["note_body_block_v2"];
-
-    if (Object.keys(inlineErrors).length) {
-      await ack({ response_action: "errors", errors: inlineErrors });
-    } else {
-      await ack();
-    }
-
-    // For dynamic blocks, send user-friendly guidance
-    if (!recordType || !pipelineId || !stageId || !recordId) {
-      try {
-        await client.chat.postEphemeral({
-          channel: originChannelId,
-          user: originUserId,
-          text: "⚠️ Please select Record Type → Pipeline → Stage → Record before submitting.",
-        });
-      } catch (_) {}
-    }
-
+  if (Object.keys(errors).length) {
+    await ack({ response_action: "errors", errors });
     return;
   }
 
   await ack();
+
+  if (!stageId || !recordId) {
+    try {
+      await client.chat.postEphemeral({
+        channel: meta.originChannelId || body.user.id,
+        user: meta.originUserId || body.user.id,
+        text: "⚠️ Please select Pipeline Stage and Record before submitting.",
+      });
+    } catch (_) {}
+    return;
+  }
 
   if (!ZAPIER_HUBNOTE_WEBHOOK_URL) {
     await client.chat.postMessage({
@@ -1303,8 +1083,8 @@ app.view("hubnote_modal_submit_v2", async ({ ack, body, view, client, logger }) 
         source: "slack",
         command_name: "hubnote",
         version: "v2",
-        correlation_id: correlationId,
-        hubspot_object_type: recordType, // "ticket" | "deal"
+        correlation_id: meta.correlationId || hubnoteMakeId("hubnote"),
+        hubspot_object_type: recordType,
         hubspot_object_id: String(recordId),
         hubspot_pipeline_id: String(pipelineId),
         hubspot_stage_id: String(stageId),
@@ -1312,26 +1092,139 @@ app.view("hubnote_modal_submit_v2", async ({ ack, body, view, client, logger }) 
         note_body: noteBody,
         submitted_by_slack_user_id: body.user.id,
         submitted_at: new Date().toISOString(),
-        origin_channel_id: originChannelId,
-        origin_user_id: originUserId,
+        origin_channel_id: meta.originChannelId || body.user.id,
+        origin_user_id: meta.originUserId || body.user.id,
       },
       { headers: { "Content-Type": "application/json" }, timeout: 10000 }
     );
 
     await client.chat.postEphemeral({
-      channel: originChannelId,
-      user: originUserId,
+      channel: meta.originChannelId || body.user.id,
+      user: meta.originUserId || body.user.id,
       text: "⏳ Creating note in HubSpot…",
     });
   } catch (e) {
     logger.error(e);
     await client.chat.postEphemeral({
-      channel: originChannelId,
-      user: originUserId,
+      channel: meta.originChannelId || body.user.id,
+      user: meta.originUserId || body.user.id,
       text: "❌ I couldn’t send the note to Zapier. Check Zapier + Render logs and try again.",
     });
   }
 });
+
+// ------------------------------
+// Zapier -> SyllaBot callback -> ephemeral Yes/No
+// ------------------------------
+receiver.app.post("/zapier/hubnote/callback", express.json(), async (req, res) => {
+  try {
+    if (ZAPIER_HUBNOTE_SECRET) {
+      const incoming = req.headers["x-zapier-secret"];
+      if (!incoming || incoming !== ZAPIER_HUBNOTE_SECRET) {
+        return res.status(401).json({ ok: false, error: "unauthorized" });
+      }
+    }
+
+    const {
+      status,
+      correlation_id,
+      hubspot_note_id,
+      hubspot_object_type,
+      hubspot_object_id,
+      origin_channel_id,
+      origin_user_id,
+    } = req.body || {};
+
+    if (!origin_channel_id || !origin_user_id) {
+      return res.status(400).json({ ok: false, error: "missing origin_channel_id/origin_user_id" });
+    }
+
+    if (status !== "success" || !hubspot_note_id) {
+      await app.client.chat.postEphemeral({
+        channel: origin_channel_id,
+        user: origin_user_id,
+        text: "❌ HubSpot note creation failed. Check Zapier logs for details.",
+      });
+      return res.status(200).json({ ok: true, handled: "failure" });
+    }
+
+    const sessionId = hubnoteMakeId("hubnote_session");
+    hubnoteSetSession(sessionId, {
+      correlationId: correlation_id,
+      hubspotNoteId: String(hubspot_note_id),
+      hubspotObjectType: hubspot_object_type || "ticket",
+      hubspotObjectId: hubspot_object_id ? String(hubspot_object_id) : "",
+      originChannelId: origin_channel_id,
+      originUserId: origin_user_id,
+      dmChannelId: "",
+    });
+
+    await app.client.chat.postEphemeral({
+      channel: origin_channel_id,
+      user: origin_user_id,
+      ...buildHubnoteAddFilesEphemeral({ sessionId }),
+    });
+
+    return res.status(200).json({ ok: true, sessionId });
+  } catch (e) {
+    console.error("[hubnote callback] error:", e?.message || e);
+    return res.status(500).json({ ok: false, error: "server_error" });
+  }
+});
+
+// ------------------------------
+// Ephemeral button handlers
+// ------------------------------
+app.action("hubnote_add_files_no", async ({ ack, body, client, logger }) => {
+  await ack();
+  try {
+    const sessionId = body?.actions?.[0]?.value || "";
+    if (sessionId) hubnoteDeleteSession(sessionId);
+
+    const channelId = body?.channel?.id;
+    const userId = body?.user?.id;
+    if (channelId && userId) {
+      await client.chat.postEphemeral({
+        channel: channelId,
+        user: userId,
+        text: "✅ All set — no files added.",
+      });
+    }
+  } catch (e) {
+    logger.error(e);
+  }
+});
+
+app.action("hubnote_add_files_yes", async ({ ack, body, client, logger }) => {
+  await ack();
+  try {
+    const sessionId = body?.actions?.[0]?.value || "";
+    const session = hubnoteGetSession(sessionId);
+
+    if (!session) {
+      const channelId = body?.channel?.id;
+      const userId = body?.user?.id;
+      if (channelId && userId) {
+        await client.chat.postEphemeral({
+          channel: channelId,
+          user: userId,
+          text: "⚠️ That attachment session expired. Please run /hubnote again.",
+        });
+      }
+      return;
+    }
+
+    const dm = await client.conversations.open({ users: session.originUserId });
+    const dmChannelId = dm?.channel?.id;
+
+    if (!dmChannelId) {
+      await client.chat.postEphemeral({
+        channel: session.originChannelId,
+        user: session.originUserId,
+        text: "❌ I couldn’t open a DM for file uploads. Please try again.",
+      });
+      return;
+    }
 
     hubnoteSetSession(sessionId, { ...session, dmChannelId });
 
@@ -1350,7 +1243,9 @@ app.view("hubnote_modal_submit_v2", async ({ ack, body, view, client, logger }) 
   }
 });
 
-// DM button: open Attach Files modal
+// ------------------------------
+// DM button -> open attach modal
+// ------------------------------
 app.action("hubnote_open_attach_modal", async ({ ack, body, client, logger }) => {
   await ack();
   try {
@@ -1367,7 +1262,9 @@ app.action("hubnote_open_attach_modal", async ({ ack, body, client, logger }) =>
   }
 });
 
-// Options loader for selecting Slack files (requires files:read scope)
+// ------------------------------
+// File selector options (requires files:read scope)
+// ------------------------------
 app.options("hubnote_files_select", async ({ ack, body, options, client, logger }) => {
   try {
     const sessionId = parsePrivateMetadata(body?.view?.private_metadata)?.sessionId || "";
@@ -1375,9 +1272,7 @@ app.options("hubnote_files_select", async ({ ack, body, options, client, logger 
 
     if (!session) {
       return await ack({
-        options: [
-          { text: { type: "plain_text", text: "Session expired — reopen /hubnote" }, value: "SESSION_EXPIRED" },
-        ],
+        options: [{ text: { type: "plain_text", text: "Session expired — rerun /hubnote" }, value: "SESSION_EXPIRED" }],
       });
     }
 
@@ -1399,10 +1294,7 @@ app.options("hubnote_files_select", async ({ ack, body, options, client, logger 
       .slice(0, 50)
       .map((f) => {
         const label = f.title || f.name || `File ${f.id}`;
-        return {
-          text: { type: "plain_text", text: label.slice(0, 75) },
-          value: String(f.id),
-        };
+        return { text: { type: "plain_text", text: label.slice(0, 75) }, value: String(f.id) };
       });
 
     if (!filtered.length) {
@@ -1420,7 +1312,9 @@ app.options("hubnote_files_select", async ({ ack, body, options, client, logger 
   }
 });
 
-// Attach modal submit -> forward selected file IDs (and note ID) to Zapier
+// ------------------------------
+// Attach modal submit -> Zapier
+// ------------------------------
 app.view("hubnote_attach_modal_submit", async ({ ack, body, view, client, logger }) => {
   const meta = parsePrivateMetadata(view.private_metadata);
   const sessionId = meta.sessionId || "";
@@ -1431,9 +1325,7 @@ app.view("hubnote_attach_modal_submit", async ({ ack, body, view, client, logger
     return;
   }
 
-  const selected =
-    view.state.values.files_select_block.hubnote_files_select.selected_options || [];
-
+  const selected = view.state.values.files_select_block.hubnote_files_select.selected_options || [];
   const slackFileIds = selected.map((o) => o.value).filter(Boolean);
 
   if (!slackFileIds.length) {
@@ -1443,15 +1335,12 @@ app.view("hubnote_attach_modal_submit", async ({ ack, body, view, client, logger
 
   await ack();
 
-  const attachNote =
-    view.state.values.attach_note_block?.attach_note_input?.value?.trim() || "";
+  const attachNote = view.state.values.attach_note_block?.attach_note_input?.value?.trim() || "";
 
   if (!ZAPIER_HUBNOTE_ATTACH_WEBHOOK_URL) {
     await client.chat.postMessage({
       channel: session.dmChannelId || body.user.id,
-      text:
-        "⚠️ Files selected, but ZAPIER_HUBNOTE_ATTACH_WEBHOOK_URL is not set.\n" +
-        "Set it in Render env vars to enable file attachment routing.",
+      text: "⚠️ ZAPIER_HUBNOTE_ATTACH_WEBHOOK_URL is not set. Add it in Render to enable attachments.",
     });
     return;
   }
@@ -1492,5 +1381,5 @@ app.view("hubnote_attach_modal_submit", async ({ ack, body, view, client, logger
 // ==============================
 (async () => {
   await app.start(process.env.PORT || 3000);
-  console.log("⚡️ SyllaBot is running (/cstask + /hubnote v2 + file DM flow)");
+  console.log("⚡️ SyllaBot is running (cstask + hubnote v2)");
 })();
