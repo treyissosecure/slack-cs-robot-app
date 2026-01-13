@@ -731,55 +731,22 @@ async function hsSearchRecords({ recordType, pipelineId, stageId, query }) {
     filterGroups: [
       {
         filters: [
-          { propertyName: pipelineProp, operator: "EQ", value: String(pipelineId) },
-          { propertyName: stageProp, operator: "EQ", value: String(stageId) },
+          {
+            propertyName: pipelineProp,
+            operator: "EQ",
+            value: String(pipelineId),
+          },
+          {
+            propertyName: stageProp,
+            operator: "EQ",
+            value: String(stageId),
+          },
         ],
       },
     ],
     properties,
     limit: 50,
   };
-
-  const q = (query || "").trim();
-  if (q) body.query = q;
-
-  const data = await hubspotRequest(
-    "POST",
-    `/crm/v3/objects/${objectType}/search`,
-    body
-  );
-
-  const results = data?.results || [];
-  return results.map((r) => {
-    const id = String(r.id);
-    const props = r.properties || {};
-    const label =
-      recordType === "deal"
-        ? props.dealname || `Deal ${id}`
-        : props.subject || `Ticket ${id}`;
-    return { id, label };
-  });
-}
-  const q = (query || "").trim();
-  if (q) body.query = q;
-
-  const data = await hubspotRequest(
-    "POST",
-    `/crm/v3/objects/${objectType}/search`,
-    body
-  );
-
-  const results = data?.results || [];
-  return results.map((r) => {
-    const id = String(r.id);
-    const props = r.properties || {};
-    const label =
-      recordType === "deal"
-        ? props.dealname || `Deal ${id}`
-        : props.subject || `Ticket ${id}`;
-    return { id, label };
-  });
-}
 
   const q = (query || "").trim();
   if (q) body.query = q;
@@ -896,7 +863,6 @@ function buildHubnoteModalV2({ correlationId, originChannelId, originUserId }) {
     ],
   };
 }
-
 // --------------------------------
 // Shared ephemeral/DM/file UI builders (unchanged)
 // --------------------------------
