@@ -711,6 +711,61 @@ function hsApiObjectType(recordType) {
   // HubSpot API endpoints use plural object names
   return recordType === "deal" ? "deals" : "tickets";
 }
+// ==============================
+// HUBSPOT: pipelines + cache helpers (required for v2 dropdowns)
+// ==============================
+
+function hsCacheGetPipelines(recordType) {
+  const key = recordType === "deal" ? "deal" : "ticket";
+  const cached = hsCache.pipelines.get(key);
+  if (!cached) return null;
+  if (Date.now() - cached.at > HS_CACHE_MS) return null;
+  return cached.pipelines || null;
+}
+
+function hsCacheSetPipelines(recordType, pipelines) {
+  const key = recordType === "deal" ? "deal" : "ticket";
+  hsCache.pipelines.set(key, { at: Date.now(), pipelines: pipelines || [] });
+}
+
+function hsPipelineLabel(p) {
+  return p?.label || p?.displayName || p?.name || `Pipeline ${p?.id || ""}`.trim();
+}
+
+function hsStageLabel(s) {
+  return s?.label || s?.displayName || s?.name || `Stage ${s?.id || ""}`.trim();
+}
+
+// Fetch pipelines + stages for Ticket/Deal (cached)
+async function hsGetPipelines(recordType) {
+  const rt = recordType === "deal" ? "deal" : "ticket";
+
+  const cached = hsCacheGetPipelines(rt);
+  if (cached) return cached;
+
+  const objectType = hsApiObjectType(rt); // "deals" or "tickets"
+
+  // HubSpot pipelines endpoint
+  const data = await hubspotRequest("GET", `/crm/v3/pipelines/${objectType}`);
+
+  const results = data?.results || [];
+
+  const pipelines = results.map((p) => {
+    const stages = (p?.stages || []).map((s) => ({
+      id: String(s.id),
+      label: hsStageLabel(s),
+    }));
+
+    return {
+      id: String(p.id),
+      label: hsPipelineLabel(p),
+      stages,
+    };
+  });
+
+  hsCacheSetPipelines(rt, pipelines);
+  return pipelines;
+}
 
 async function hsSearchRecords({ recordType, pipelineId, stageId, query }) {
   const objectType = hsApiObjectType(recordType);
