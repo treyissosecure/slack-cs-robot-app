@@ -275,7 +275,6 @@ app.options("board_select", async ({ options, ack, logger }) => {
           },
         ],
       });
-    }
 
     await ack({ options: opts });
   } catch (e) {
