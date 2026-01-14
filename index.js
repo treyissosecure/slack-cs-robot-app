@@ -631,10 +631,7 @@ async function hsSearchRecords({ recordType, pipelineId, stageId, query }) {
       ? ["dealname", pipelineProp, stageProp]
       : ["subject", pipelineProp, stageProp];
 
-  const q = (query || "").trim();
-
-  // Primary: server-side filtered search (fast/accurate when HS accepts filters)
-  const primaryBody = {
+  const body = {
     filterGroups: [
       {
         filters: [
@@ -644,65 +641,24 @@ async function hsSearchRecords({ recordType, pipelineId, stageId, query }) {
       },
     ],
     properties,
-    limit: 100,
+    limit: 50,
   };
-  if (q) primaryBody.query = q;
 
-  const primary = await hubspotRequest(
+  const q = (query || "").trim();
+  if (q) body.query = q;
+
+  const data = await hubspotRequest(
     "POST",
     `/crm/v3/objects/${objectType}/search`,
-    primaryBody
+    body
   );
 
-  let results = primary?.results || [];
-
-  // Fallback: HubSpot can be picky about filtering on pipeline/stage for some portals.
-  // If primary returns nothing, do an unfiltered search (sorted by last modified),
-  // then filter client-side by the same pipeline + stage values.
-  
-// If HubSpot search returns 0 results (can happen with some pipeline/stage combos),
-// page through recent records and filter client-side until we find matches.
-if (!results.length && !q && pipelineId && stageId && pipelineProp && stageProp) {
-  try {
-    const p = String(pipelineId);
-    const st = String(stageId);
-
-    const maxPages = 5; // 5 * 100 = 500 recent records
-    let after = undefined;
-    let matches = [];
-
-    for (let i = 0; i < maxPages && matches.length < 50; i++) {
-      const body = {
-        properties,
-        limit: 100,
-        sorts: ["-hs_lastmodifieddate"],
-        ...(after ? { after } : {}),
-      };
-
-      const resp = await hubspotRequest("POST", `/crm/v3/objects/${objectType}/search`, body);
-      const all = resp?.results || [];
-
-      for (const r of all) {
-        const props = r.properties || {};
-        if (String(props[pipelineProp] ?? "") === p && String(props[stageProp] ?? "") === st) {
-          matches.push(r);
-        }
-      }
-
-      after = resp?.paging?.next?.after;
-      if (!after) break;
-    }
-
-    if (matches.length) results = matches;
-  } catch (_) {}
-}
-return results.map((r) => {
+  const results = data?.results || [];
+  return results.map((r) => {
     const id = String(r.id);
     const props = r.properties || {};
     const label =
-      recordType === "deal"
-        ? props.dealname || `Deal ${id}`
-        : props.subject || `Ticket ${id}`;
+      recordType === "deal" ? props.dealname || `Deal ${id}` : props.subject || `Ticket ${id}`;
     return { id, label };
   });
 }
@@ -769,52 +725,7 @@ async function hsCreateNoteAndAssociate({ hubspot_object_type, hubspot_object_id
   };
 }
 
-function getPlainTextInputValue(viewStateValues, blockId, actionId) {
-  try {
-    return viewStateValues?.[blockId]?.[actionId]?.value ?? "";
-  } catch {
-    return "";
-  }
-}
-
-function bump(meta, key) {
-  meta[key] = Number(meta[key] || 0) + 1;
-  return meta[key];
-}
-
-function buildHubnoteModalV2({
-  correlationId,
-  originChannelId,
-  originUserId,
-  recordType = "ticket",
-  pipelineId = "",
-  stageId = "",
-  // nonces used to force Slack to clear dependent selects
-  noncePipeline = 0,
-  nonceStage = 0,
-  nonceRecord = 0,
-  // preserve typed text when we rebuild the view
-  noteTitleInitial = "",
-  noteBodyInitial = "",
-} = {}) {
-  const meta = {
-    correlationId,
-    originChannelId,
-    originUserId,
-    version: "v2",
-    recordType,
-    pipelineId,
-    stageId,
-    noncePipeline,
-    nonceStage,
-    nonceRecord,
-  };
-
-  // Changing block_id forces Slack to discard previous state for that input.
-  const pipelineBlockId = `pipeline_block_v2_${noncePipeline}`;
-  const stageBlockId = `stage_block_v2_${nonceStage}`;
-  const recordBlockId = `record_block_v2_${nonceRecord}`;
-
+function buildHubnoteModalV2({ correlationId, originChannelId, originUserId, recordType = "ticket", pipelineId = "", stageId = "" }) {
   return {
     type: "modal",
     callback_id: "hubnote_modal_submit_v2",
@@ -823,33 +734,36 @@ function buildHubnoteModalV2({
     close: { type: "plain_text", text: "Cancel", emoji: true },
     clear_on_close: false,
     notify_on_close: false,
-    private_metadata: JSON.stringify(meta),
+    private_metadata: JSON.stringify({
+      correlationId,
+      originChannelId,
+      originUserId,
+      version: "v2",
+      recordType,
+      pipelineId,
+      stageId,
+    }),
     blocks: [
       {
         type: "input",
         block_id: "record_type_block_v2",
         label: { type: "plain_text", text: "Record Type", emoji: true },
-        optional: false,
         dispatch_action: true,
         element: {
           type: "static_select",
           action_id: "hubnote_v2_record_type_select",
           placeholder: { type: "plain_text", text: "Ticket or Deal", emoji: true },
-          initial_option: {
-            text: { type: "plain_text", text: recordType === "deal" ? "Deal" : "Ticket", emoji: true },
-            value: recordType === "deal" ? "deal" : "ticket",
-          },
           options: [
-            { text: { type: "plain_text", text: "Ticket", emoji: true }, value: "ticket" },
-            { text: { type: "plain_text", text: "Deal", emoji: true }, value: "deal" },
+            option("Ticket", "ticket"),
+            option("Deal", "deal"),
           ],
+          initial_option: recordType === "deal" ? option("Deal", "deal") : option("Ticket", "ticket"),
         },
       },
       {
         type: "input",
-        block_id: pipelineBlockId,
+        block_id: "pipeline_block_v2",
         label: { type: "plain_text", text: "Pipeline", emoji: true },
-        optional: false,
         dispatch_action: true,
         element: {
           type: "external_select",
@@ -860,9 +774,8 @@ function buildHubnoteModalV2({
       },
       {
         type: "input",
-        block_id: stageBlockId,
+        block_id: "stage_block_v2",
         label: { type: "plain_text", text: "Pipeline Stage", emoji: true },
-        optional: false,
         dispatch_action: true,
         element: {
           type: "external_select",
@@ -873,9 +786,8 @@ function buildHubnoteModalV2({
       },
       {
         type: "input",
-        block_id: recordBlockId,
+        block_id: "record_block_v2",
         label: { type: "plain_text", text: "Record", emoji: true },
-        optional: false,
         element: {
           type: "external_select",
           action_id: "hubnote_v2_record_select",
@@ -887,25 +799,21 @@ function buildHubnoteModalV2({
         type: "input",
         block_id: "note_title_block_v2",
         label: { type: "plain_text", text: "Note Title / Subject", emoji: true },
-        optional: false,
         element: {
           type: "plain_text_input",
           action_id: "hubnote_v2_note_title_input",
           placeholder: { type: "plain_text", text: "e.g., Call recap", emoji: true },
-          initial_value: noteTitleInitial || undefined,
         },
       },
       {
         type: "input",
         block_id: "note_body_block_v2",
         label: { type: "plain_text", text: "Note Body", emoji: true },
-        optional: false,
         element: {
           type: "plain_text_input",
           action_id: "hubnote_v2_note_body_input",
           placeholder: { type: "plain_text", text: "Write your note...", emoji: true },
           multiline: true,
-          initial_value: noteBodyInitial || undefined,
         },
       },
     ],
@@ -913,7 +821,8 @@ function buildHubnoteModalV2({
 }
 
 // ==============================
-// HUBNOTE v2 COMMAND
+// /hubnote command
+// ==============================
 app.command("/hubnote", async ({ ack, body, client, logger }) => {
   await ack();
 
@@ -947,44 +856,25 @@ app.command("/hubnote", async ({ ack, body, client, logger }) => {
 // When Record Type changes, wipe pipeline + stage in metadata so downstream selects refresh.
 app.action("hubnote_v2_record_type_select", async ({ ack, body, client, logger }) => {
   await ack();
-
   try {
+    const selected = body?.actions?.[0]?.selected_option?.value || "ticket";
     const view = body?.view;
     if (!view?.id) return;
 
-    const selectedRecordType = body?.actions?.[0]?.selected_option?.value || "ticket";
-
     const meta = parsePrivateMetadata(view.private_metadata);
-    meta.recordType = selectedRecordType;
-
-    // Reset dependent selects
+    meta.recordType = selected;
     meta.pipelineId = "";
     meta.stageId = "";
-    bump(meta, "noncePipeline");
-    bump(meta, "nonceStage");
-    bump(meta, "nonceRecord");
 
-    // Preserve any typed text
-    const noteTitleInitial = getPlainTextInputValue(view.state?.values, "note_title_block_v2", "hubnote_v2_note_title_input");
-    const noteBodyInitial = getPlainTextInputValue(view.state?.values, "note_body_block_v2", "hubnote_v2_note_body_input");
-
+    const cleanView = buildCleanViewPayload(view, JSON.stringify(meta));
     await client.views.update({
       view_id: view.id,
       hash: view.hash,
-      view: buildHubnoteModalV2({
-        correlationId: meta.correlationId,
-        originChannelId: meta.originChannelId,
-        originUserId: meta.originUserId,
-        recordType: meta.recordType,
-        pipelineId: meta.pipelineId,
-        stageId: meta.stageId,
-        noncePipeline: meta.noncePipeline,
-        nonceStage: meta.nonceStage,
-        nonceRecord: meta.nonceRecord,
-        noteTitleInitial,
-        noteBodyInitial,
-      }),
+      view: cleanView,
     });
+
+    // warm cache
+    hsGetPipelines(selected).catch(() => {});
   } catch (e) {
     logger.error(e);
   }
@@ -1021,40 +911,20 @@ app.options("hubnote_v2_pipeline_select", async ({ body, options, ack, logger })
 // When Pipeline changes, store pipelineId, clear stageId
 app.action("hubnote_v2_pipeline_select", async ({ ack, body, client, logger }) => {
   await ack();
-
   try {
+    const selectedPipelineId = body?.actions?.[0]?.selected_option?.value || "";
     const view = body?.view;
     if (!view?.id) return;
 
-    const selectedPipelineId = body?.actions?.[0]?.selected_option?.value || "";
-
     const meta = parsePrivateMetadata(view.private_metadata);
     meta.pipelineId = selectedPipelineId;
-
-    // Reset downstream
     meta.stageId = "";
-    bump(meta, "nonceStage");
-    bump(meta, "nonceRecord");
 
-    const noteTitleInitial = getPlainTextInputValue(view.state?.values, "note_title_block_v2", "hubnote_v2_note_title_input");
-    const noteBodyInitial = getPlainTextInputValue(view.state?.values, "note_body_block_v2", "hubnote_v2_note_body_input");
-
+    const cleanView = buildCleanViewPayload(view, JSON.stringify(meta));
     await client.views.update({
       view_id: view.id,
       hash: view.hash,
-      view: buildHubnoteModalV2({
-        correlationId: meta.correlationId,
-        originChannelId: meta.originChannelId,
-        originUserId: meta.originUserId,
-        recordType: meta.recordType || "ticket",
-        pipelineId: meta.pipelineId,
-        stageId: meta.stageId,
-        noncePipeline: meta.noncePipeline || 0,
-        nonceStage: meta.nonceStage || 0,
-        nonceRecord: meta.nonceRecord || 0,
-        noteTitleInitial,
-        noteBodyInitial,
-      }),
+      view: cleanView,
     });
   } catch (e) {
     logger.error(e);
@@ -1097,38 +967,19 @@ app.options("hubnote_v2_stage_select", async ({ body, options, ack, logger }) =>
 // When Stage changes, store stageId
 app.action("hubnote_v2_stage_select", async ({ ack, body, client, logger }) => {
   await ack();
-
   try {
+    const selectedStageId = body?.actions?.[0]?.selected_option?.value || "";
     const view = body?.view;
     if (!view?.id) return;
-
-    const selectedStageId = body?.actions?.[0]?.selected_option?.value || "";
 
     const meta = parsePrivateMetadata(view.private_metadata);
     meta.stageId = selectedStageId;
 
-    // Reset downstream record select
-    bump(meta, "nonceRecord");
-
-    const noteTitleInitial = getPlainTextInputValue(view.state?.values, "note_title_block_v2", "hubnote_v2_note_title_input");
-    const noteBodyInitial = getPlainTextInputValue(view.state?.values, "note_body_block_v2", "hubnote_v2_note_body_input");
-
+    const cleanView = buildCleanViewPayload(view, JSON.stringify(meta));
     await client.views.update({
       view_id: view.id,
       hash: view.hash,
-      view: buildHubnoteModalV2({
-        correlationId: meta.correlationId,
-        originChannelId: meta.originChannelId,
-        originUserId: meta.originUserId,
-        recordType: meta.recordType || "ticket",
-        pipelineId: meta.pipelineId || "",
-        stageId: meta.stageId || "",
-        noncePipeline: meta.noncePipeline || 0,
-        nonceStage: meta.nonceStage || 0,
-        nonceRecord: meta.nonceRecord || 0,
-        noteTitleInitial,
-        noteBodyInitial,
-      }),
+      view: cleanView,
     });
   } catch (e) {
     logger.error(e);
