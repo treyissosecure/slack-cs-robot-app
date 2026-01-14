@@ -116,6 +116,35 @@ const app = new App({
   logLevel: LogLevel.DEBUG,
 });
 
+// ==============================
+// /hubnote — handler (ACK FIRST)
+// ==============================
+app.command("/hubnote", async ({ ack, body, client, logger }) => {
+  await ack(); // must be first
+
+  try {
+    const correlationId = `hubnote_${crypto.randomBytes(12).toString("hex")}`;
+
+    await client.views.open({
+      trigger_id: body.trigger_id,
+      view: buildHubnoteModalV2({
+        correlationId,
+        originChannelId: body.channel_id,
+        originUserId: body.user_id,
+      }),
+    });
+  } catch (e) {
+    logger.error(e);
+    try {
+      await client.chat.postEphemeral({
+        channel: body.channel_id,
+        user: body.user_id,
+        text: "❌ I couldn’t open the HubSpot note form. Please try again.",
+      });
+    } catch (_) {}
+  }
+});
+
 // ===== DEBUG: Bolt event tracing =====
 app.use(async ({ body, next }) => {
   try {
