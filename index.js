@@ -627,6 +627,11 @@ async function hsGetPipelines(recordType) {
 async function hsSearchRecords({ recordType, pipelineId, stageId, query }) {
   // HubSpot object types are plural in the v3 objects API
   const objectTypePlural = recordType === "deal" ? "deals" : "tickets";
+  
+  // Filters use different property names for deals vs tickets
+  const pipelineProp = recordType === "ticket" ? HS_TICKET_PIPELINE_PROP : HS_DEAL_PIPELINE_PROP;
+  const stageProp    = recordType === "ticket" ? HS_TICKET_STAGE_PROP    : HS_DEAL_STAGE_PROP;
+
   const trimmedQuery = (query ?? "").trim();
   const baseRequest = {
     filterGroups: [],
