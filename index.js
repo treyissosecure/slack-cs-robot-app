@@ -28,6 +28,12 @@ const { App, ExpressReceiver, LogLevel } = require("@slack/bolt");
 const axios = require("axios");
 const express = require("express");
 const crypto = require("crypto");
+// HubSpot default property internal names (allow override via env)
+const HS_TICKET_PIPELINE_PROP = process.env.HS_TICKET_PIPELINE_PROP || "hs_pipeline";
+const HS_TICKET_STAGE_PROP    = process.env.HS_TICKET_STAGE_PROP    || "hs_pipeline_stage";
+
+const HS_DEAL_PIPELINE_PROP   = process.env.HS_DEAL_PIPELINE_PROP   || "pipeline";
+const HS_DEAL_STAGE_PROP      = process.env.HS_DEAL_STAGE_PROP      || "dealstage";
 
 // ==============================
 // CONFIG
@@ -625,8 +631,8 @@ async function hsSearchRecords({ recordType, pipelineId, stageId, query }) {
   const objectTypePlural = recordType === "deal" ? "deals" : "tickets";
 
   // Filters use different property names for deals vs tickets
-  const pipelineProp = recordType === "deal" ? HS_DEAL_PIPELINE_PROP : HS_TICKET_PIPELINE_PROP;
-  const stageProp = recordType === "deal" ? HS_DEAL_STAGE_PROP : HS_TICKET_STAGE_PROP;
+  const pipelineProp = recordType === "ticket" ? HS_TICKET_PIPELINE_PROP : HS_DEAL_PIPELINE_PROP;
+  const stageProp    = recordType === "ticket" ? HS_TICKET_STAGE_PROP    : HS_DEAL_STAGE_PROP;
 
   const trimmedQuery = (query ?? "").trim();
   const baseRequest = {
