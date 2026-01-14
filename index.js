@@ -307,6 +307,19 @@ function nowIso() {
   return new Date().toISOString();
 }
 
+app.view("hubnote_modal_submit_v2", async ({ ack, body, view, client, logger }) => {
+  await ack();
+  // ...rest of handler...
+});
+
+// then keep going with:
+app.options("hubnote_v2_pipeline_select", async (...) => { ... });
+app.action("hubnote_v2_pipeline_select", async (...) => { ... });
+// etc...
+
+// at the bottom:
+(async () => { await app.start(...); })();
+
 // ==============================
 // MONDAY API HELPERS
 // ==============================
