@@ -61,6 +61,18 @@ function safeJson(v) {
   try { return JSON.stringify(v); } catch (e) { return String(v); }
 }
 
+function safeJsonParse(str, fallback = null) {
+  try {
+    if (str === undefined || str === null) return fallback;
+    if (typeof str !== "string") return str; // already parsed
+    const trimmed = str.trim();
+    if (!trimmed) return fallback;
+    return JSON.parse(trimmed);
+  } catch (e) {
+    return fallback;
+  }
+}
+
 
 // ==============================
 // SLACK RECEIVER
@@ -1188,77 +1200,66 @@ setImmediate(() => {
 
 
 app.options("hubnote_v2_record_select", async ({ body, options, ack, logger }) => {
-  // IMPORTANT: external_select options requests must be acknowledged within 3 seconds.
-  // If HubSpot is slow, we serve cached results (prefetched on stage selection) or a
-  // "Loading…" placeholder rather than timing out (which Slack shows as "No results").
+  // IMPORTANT: external_select with min_query_length: 0 will call this with an empty query.
+  const q = (options && typeof options.value === "string") ? options.value.trim() : "";
+  const meta = safeJsonParse(body?.view?.private_metadata, {}) || {};
+  const recordType = meta.recordType || "ticket";
+  const pipelineId = meta.pipelineId ?? "";
+  const stageId = meta.stageId ?? "";
+
+  const cacheKey = `recopt:${recordType}:${pipelineId}:${stageId}:${q || "__empty__"}`;
+
   try {
-    const meta = safeJsonParse(body?.view?.private_metadata) || {};
-    const recordType = meta.recordType || "ticket";
-    const pipelineId = meta.pipelineId || "";
-    const stageId = meta.stageId || "";
-
-    const qRaw = options?.value;
-    const q = typeof qRaw === "string" ? qRaw.trim() : "";
-
-    if (!pipelineId || !stageId) {
-      await ack({ options: [option("Select a pipeline + stage first", "missing_pipeline_stage")] });
-      return;
-    }
-
-    // Fast path: serve from cache if present
-    const cacheKey = `records:${recordType}:${pipelineId}:${stageId}:${q || ""}`;
     const cached = hsCacheGet(cacheKey);
-    if (Array.isArray(cached) && cached.length > 0) {
-      logger?.debug?.(
+    if (cached && cached.length) {
+      logger.debug(
         `[Slack] record_select options (cached): recordType=${recordType} pipelineId=${pipelineId} stageId=${stageId} q="${q}" -> ${cached.length}`
       );
-      await ack({ options: cached.map((r) => option(r.label, r.value)) });
-      return;
+      return await ack({ options: cached });
     }
 
-    // If user is typing, try a quick search; otherwise rely on prefetched cache.
-    if (q) {
-      const records = await hsSearchRecords({
-        recordType,
-        pipelineId,
-        stageId,
-        query: q,
-        logger,
-        timeoutMs: 2200,
-        cacheTtlMs: 30_000,
-      });
+    const records = await hsSearchRecords(recordType, { pipelineId, stageId, q });
 
-      logger?.debug?.(
-        `[Slack] record_select options: recordType=${recordType} pipelineId=${pipelineId} stageId=${stageId} q="${q}" -> ${records.length}`
-      );
+    const optionsOut = (records || []).map((r) => {
+      const rawLabel =
+        r?.properties?.subject ||
+        r?.properties?.dealname ||
+        r?.properties?.name ||
+        r?.properties?.hs_ticket_subject ||
+        `ID ${r?.id}`;
 
-      await ack({
-        options:
-          records.length > 0
-            ? records.map((r) => option(r.label, r.value))
-            : [option("No matches. Try a different search.", "no_matches")],
-      });
-      return;
-    }
+      let label = String(rawLabel || "").replace(/\s+/g, " ").trim();
+      if (!label) label = `ID ${r?.id}`;
+      if (label.length > 75) label = `${label.slice(0, 72)}...`;
 
-    // Empty query: immediately return placeholder and kick off background prefetch.
-    // Slack will call this handler again when the user re-opens the dropdown (or types).
-    setImmediate(() => {
-      hsSearchRecords({
-        recordType,
-        pipelineId,
-        stageId,
-        query: "",
-        logger,
-        timeoutMs: 8000,
-        cacheTtlMs: 30_000,
-      }).catch(() => {});
+      const value = String(r?.id ?? "").slice(0, 75) || "__missing__";
+
+      return {
+        text: { type: "plain_text", text: label, emoji: true },
+        value,
+      };
     });
 
-    await ack({ options: [option("Loading records… (re-open or start typing)", "loading_records")] });
+    if (optionsOut.length) {
+      hsCacheSet(cacheKey, optionsOut, 60);
+    }
+
+    logger.debug(
+      `[Slack] record_select options: recordType=${recordType} pipelineId=${pipelineId} stageId=${stageId} q="${q}" -> ${optionsOut.length}`
+    );
+
+    if (!optionsOut.length) {
+      return await ack({
+        options: [{ text: { type: "plain_text", text: "No records :(", emoji: true }, value: "__none__" }],
+      });
+    }
+
+    return await ack({ options: optionsOut });
   } catch (e) {
-    logger?.error?.(e);
-    await ack({ options: [option("Error loading records. Try again.", "error_records")] });
+    logger.error(`[Slack] record_select options error: ${e?.message || e}`);
+    return await ack({
+      options: [{ text: { type: "plain_text", text: "ERROR — try again", emoji: true }, value: "__error__" }],
+    });
   }
 });
 
