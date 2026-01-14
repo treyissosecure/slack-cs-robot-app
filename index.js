@@ -1310,7 +1310,6 @@ app.view("hubnote_modal_submit_v2", async ({ ack, body, view, client, logger }) 
 // Creates a HubSpot note + associates it to a Ticket or Deal.
 // ==============================
 
-const HS_ASSOC_CACHE_MS = 60 * 60 * 1000; // 1 hour
 const hsAssocCache = {
   deal: { at: 0, associationTypeId: null },
   ticket: { at: 0, associationTypeId: null },
