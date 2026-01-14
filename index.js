@@ -28,12 +28,6 @@ const { App, ExpressReceiver, LogLevel } = require("@slack/bolt");
 const axios = require("axios");
 const express = require("express");
 const crypto = require("crypto");
-// HubSpot default property internal names (allow override via env)
-const HS_TICKET_PIPELINE_PROP = process.env.HS_TICKET_PIPELINE_PROP || "hs_pipeline";
-const HS_TICKET_STAGE_PROP    = process.env.HS_TICKET_STAGE_PROP    || "hs_pipeline_stage";
-const HS_DEAL_PIPELINE_PROP   = process.env.HS_DEAL_PIPELINE_PROP   || "pipeline";
-const HS_DEAL_STAGE_PROP      = process.env.HS_DEAL_STAGE_PROP      || "dealstage";
-const logger = console;
 
 // ==============================
 // CONFIG
@@ -51,6 +45,22 @@ const HUBSPOT_PRIVATE_APP_TOKEN = process.env.HUBSPOT_PRIVATE_APP_TOKEN || "";
 const HUBNOTE_ZAPIER_SECRET =
   process.env.HUBNOTE_ZAPIER_SECRET || process.env.ZAPIER_HUBNOTE_SECRET || "";
 const ZAPIER_HUBNOTE_SECRET = process.env.ZAPIER_HUBNOTE_SECRET || "";
+// ------------------------------------------------------------
+// Global logger + safeJson (prevents ReferenceError issues)
+// ------------------------------------------------------------
+const log = {
+  debug: (...args) => console.log("[DEBUG]", ...args),
+  info: (...args) => console.log("[INFO]", ...args),
+  warn: (...args) => console.warn("[WARN]", ...args),
+  error: (...args) => console.error("[ERROR]", ...args),
+};
+
+const logger = log;
+
+function safeJson(v) {
+  try { return JSON.stringify(v); } catch (e) { return String(v); }
+}
+
 
 // ==============================
 // SLACK RECEIVER
@@ -577,8 +587,10 @@ const hsCache = {
   assocTypeId: new Map(), // key: "tickets"|"deals" -> { at, id }
 };
 
-const HS_PIPELINE_PROP_DEAL = "pipeline";
-const HS_PIPELINE_PROP_TICKET = "hs_pipeline";
+const HS_TICKET_STAGE_PROP = "hs_pipeline_stage";
+const HS_DEAL_STAGE_PROP = "dealstage";
+const HS_DEAL_PIPELINE_PROP = "pipeline";
+const HS_TICKET_PIPELINE_PROP = "hs_pipeline";
 
 function hsApiObjectType(recordType) {
   return recordType === "deal" ? "deals" : "tickets";
@@ -624,89 +636,70 @@ async function hsGetPipelines(recordType) {
   return pipelines;
 }
 
-async function hsSearchRecords({ recordType, pipelineId, stageId, query }) {
-  // HubSpot object types are plural in the v3 objects API
-  const objectTypePlural = recordType === "deal" ? "deals" : "tickets";
-  
-  // Filters use different property names for deals vs tickets
-  const pipelineProp = recordType === "ticket" ? HS_TICKET_PIPELINE_PROP : HS_DEAL_PIPELINE_PROP;
-  const stageProp    = recordType === "ticket" ? HS_TICKET_STAGE_PROP    : HS_DEAL_STAGE_PROP;
+async function hsSearchRecords({
+  recordType,        // "ticket" | "deal"
+  pipelineId,        // optional
+  stageId,           // optional
+  query,             // user-typed string in Slack external_select
+  limit = 25,
+}) {
+  const q = (query || "").trim();
+  const cacheKey = JSON.stringify({ recordType, pipelineId, stageId, q, limit });
+  const cached = hsCacheGet(cacheKey);
+  if (cached) return cached;
 
-  const trimmedQuery = (query ?? "").trim();
-  const baseRequest = {
-    filterGroups: [],
-    sorts: [{ propertyName: "createdate", direction: "DESCENDING" }],
-    properties:
-      recordType === "deal"
-        ? ["dealname", pipelineProp, stageProp, "amount"]
-        : ["subject", pipelineProp, stageProp, "hs_ticket_priority", "createdate"],
-    limit: 20,
-  };
+  const objectType = recordType === "deal" ? "deals" : "tickets";
+  const pipelineProp = recordType === "deal" ? HS_DEAL_PIPELINE_PROP : HS_TICKET_PIPELINE_PROP;
+  const stageProp = recordType === "deal" ? HS_DEAL_STAGE_PROP : HS_TICKET_STAGE_PROP;
 
-  // Helper to run a search with optional stage/pipeline filters
-  const runSearch = async ({ includeFilters }) => {
-    const filterGroups = [];
-    if (includeFilters) {
-      const filters = [];
-      if (pipelineId) filters.push({ propertyName: pipelineProp, operator: "EQ", value: String(pipelineId) });
-      if (stageId) filters.push({ propertyName: stageProp, operator: "EQ", value: String(stageId) });
-      if (filters.length) filterGroups.push({ filters });
-    }
-    if (trimmedQuery) {
-      // Search by deal name or ticket subject
-      const qProp = recordType === "deal" ? "dealname" : "subject";
-      filterGroups.push({ filters: [{ propertyName: qProp, operator: "CONTAINS_TOKEN", value: trimmedQuery }] });
-    }
+  // Build filters (HubSpot CRM search API)
+  const filterGroups = [];
 
-    const payload = { ...baseRequest, filterGroups };
-    logger.debug(`[HS] search ${objectTypePlural}: includeFilters=${includeFilters} pipelineId=${pipelineId} stageId=${stageId} q="${trimmedQuery}"`);
-    return await hubspotRequest(`/crm/v3/objects/${objectTypePlural}/search`, { method: "POST", body: payload });
+  // Always include pipeline filter when provided (your UI requires pipeline before stage/record)
+  if (pipelineId !== undefined && pipelineId !== null && String(pipelineId).length > 0) {
+    filterGroups.push({
+      filters: [{ propertyName: pipelineProp, operator: "EQ", value: String(pipelineId) }],
+    });
+  }
+
+  if (stageId !== undefined && stageId !== null && String(stageId).length > 0) {
+    // Add stage filter in the same group (AND)
+    if (filterGroups.length === 0) filterGroups.push({ filters: [] });
+    filterGroups[0].filters.push({ propertyName: stageProp, operator: "EQ", value: String(stageId) });
+  }
+
+  // If the user typed something, add a "contains token" type filter on a human-readable field
+  // Tickets: subject; Deals: dealname
+  if (q.length > 0) {
+    const nameProp = recordType === "deal" ? "dealname" : "subject";
+    // Put the text search in the same group for AND behavior
+    if (filterGroups.length === 0) filterGroups.push({ filters: [] });
+    filterGroups[0].filters.push({ propertyName: nameProp, operator: "CONTAINS_TOKEN", value: q });
+  }
+
+  const properties =
+    recordType === "deal" ? HS_DEAL_DISPLAY_PROPS : HS_TICKET_DISPLAY_PROPS;
+
+  const payload = {
+    filterGroups: filterGroups.length ? filterGroups : [{ filters: [] }],
+    sorts: [],
+    properties,
+    limit: Math.min(Math.max(Number(limit) || 25, 1), 100),
+    after: 0,
   };
 
   try {
-    // 1) Try strict (pipeline+stage) filter
-    const strictRes = await runSearch({ includeFilters: true });
-    const strictResults = Array.isArray(strictRes?.results) ? strictRes.results : [];
+    log.debug("[HubSpot] search payload:", safeJson(payload));
+    const data = await hubspotRequest("POST", `/crm/v3/objects/${objectType}/search`, payload);
 
-    if (strictResults.length > 0) {
-      logger.debug(`[HS] search ${objectTypePlural} strict results: ${strictResults.length} (total=${strictRes.total ?? "?"})`);
-      return strictResults.map((r) => ({
-        id: r.id,
-        label:
-          recordType === "deal"
-            ? r.properties?.dealname || `Deal ${r.id}`
-            : r.properties?.subject || `Ticket ${r.id}`,
-      }));
-    }
-
-    // 2) Fallback: if strict returns 0, try *without* pipeline/stage filters
-    // This helps when the stored values differ from what the pipelines endpoint returns, or if permissions prevent filtering.
-    const looseRes = await runSearch({ includeFilters: false });
-    const looseResults = Array.isArray(looseRes?.results) ? looseRes.results : [];
-
-    logger.debug(
-      `[HS] search ${objectTypePlural} fallback results: ${looseResults.length} (total=${looseRes.total ?? "?"}); strict was 0`
-    );
-
-    return looseResults.map((r) => ({
-      id: r.id,
-      label:
-        recordType === "deal"
-          ? r.properties?.dealname || `Deal ${r.id}`
-          : r.properties?.subject || `Ticket ${r.id}`,
-    }));
+    const results = Array.isArray(data?.results) ? data.results : [];
+    hsCacheSet(cacheKey, results);
+    return results;
   } catch (err) {
-    const status = err?.status || err?.response?.status;
-    const msg = err?.message || String(err);
-    const details =
-      err?.body ||
-      err?.response?.data ||
-      err?.response?.body ||
-      undefined;
-
-    logger.error(`[HS] search ${objectTypePlural} failed: status=${status ?? "?"} msg=${msg}`);
-    if (details) logger.error(`[HS] search error details: ${safeJson(details)}`);
-
+    const status = err?.response?.status;
+    const body = err?.response?.data;
+    log.error("[HubSpot] search failed:", status, safeJson(body), err?.message || err);
+    hsCacheSet(cacheKey, []);
     return [];
   }
 }
