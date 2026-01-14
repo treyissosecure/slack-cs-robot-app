@@ -81,7 +81,7 @@ receiver.app.get("/", (req, res) => res.status(200).send("OK"));
 // Creates a HubSpot note and associates it to a Ticket or Deal
 // ==============================
 
-const HUBSPOT_PRIVATE_APP_TOKEN = process.env.HUBSPOT_PRIVATE_APP_TOKEN || "";
+const HUBSPOT_TOKEN = process.env.HUBSPOT_PRIVATE_APP_TOKEN || "";
 
 // Optional: protect this endpoint (recommended). If set, Zapier must send header x-zapier-secret
 const ZAPIER_HUBNOTE_SECRET = process.env.ZAPIER_HUBNOTE_SECRET || "";
@@ -102,11 +102,11 @@ function buildHubspotNoteBody(noteTitle, noteBody) {
 }
 
 async function hubspotRequest(method, path, body) {
-  if (!HUBSPOT_PRIVATE_APP_TOKEN) throw new Error("Missing HUBSPOT_PRIVATE_APP_TOKEN");
+  if (!HUBSPOT_TOKEN) throw new Error("Missing HUBSPOT_PRIVATE_APP_TOKEN");
 
   const url = `https://api.hubapi.com${path}`;
   const headers = {
-    Authorization: `Bearer ${HUBSPOT_PRIVATE_APP_TOKEN}`,
+    Authorization: `Bearer ${HUBSPOT_TOKEN}`,
     "Content-Type": "application/json",
     Accept: "application/json",
   };
@@ -671,7 +671,13 @@ app.view("cstask_modal_submit", async ({ ack, body, view, client, logger }) => {
 // HubSpot request helper
 // ------------------------------
 async function hubspotRequest(method, path, data) {
-  if (!HUBSPOT_PRIVATE_APP_TOKEN) throw new Error("Missing HUBSPOT_PRIVATE_APP_TOKEN");
+  if (!HUBSPOT_TOKEN) throw new Error("Missing HUBSPOT_PRIVATE_APP_TOKEN");
+
+const headers = {
+  Authorization: `Bearer ${HUBSPOT_TOKEN}`,
+  "Content-Type": "application/json",
+  Accept: "application/json",
+};
 
   const res = await axios({
     method,
