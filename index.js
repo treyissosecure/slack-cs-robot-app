@@ -631,36 +631,70 @@ async function hsSearchRecords({ recordType, pipelineId, stageId, query }) {
       ? ["dealname", pipelineProp, stageProp]
       : ["subject", pipelineProp, stageProp];
 
-  const body = {
-    filterGroups: [
-      {
-        filters: [
-          { propertyName: pipelineProp, operator: "EQ", value: String(pipelineId) },
-          { propertyName: stageProp, operator: "EQ", value: String(stageId) },
-        ],
-      },
-    ],
-    properties,
-    limit: 50,
-  };
-
   const q = (query || "").trim();
-  if (q) body.query = q;
 
-  const data = await hubspotRequest(
-    "POST",
-    `/crm/v3/objects/${objectType}/search`,
-    body
-  );
+  async function runSearch(filters, limit = 100, maxPages = 3) {
+    const items = [];
+    let after = undefined;
 
-  const results = data?.results || [];
-  return results.map((r) => {
+    for (let page = 0; page < maxPages; page++) {
+      const body = {
+        filterGroups: [{ filters }],
+        properties,
+        limit,
+      };
+      if (q) body.query = q;
+      if (after !== undefined) body.after = after;
+
+      const data = await hubspotRequest("POST", `/crm/v3/objects/${objectType}/search`, body);
+      const results = data?.results || [];
+      items.push(...results);
+
+      after = data?.paging?.next?.after;
+      if (!after) break;
+    }
+
+    return items;
+  }
+
+  // Preferred: pipeline + stage (most specific)
+  const filtersPreferred = [];
+  if (pipelineId) filtersPreferred.push({ propertyName: pipelineProp, operator: "EQ", value: String(pipelineId) });
+  if (stageId) filtersPreferred.push({ propertyName: stageProp, operator: "EQ", value: String(stageId) });
+
+  let results = [];
+  if (filtersPreferred.length) {
+    results = await runSearch(filtersPreferred);
+  }
+
+  // Fallbacks (HubSpot data can be weird across pipelines/stages; also helps if the stage id in Slack is stale)
+  if ((!results || results.length === 0) && stageId) {
+    results = await runSearch([{ propertyName: stageProp, operator: "EQ", value: String(stageId) }]);
+  }
+
+  if ((!results || results.length === 0) && pipelineId) {
+    results = await runSearch([{ propertyName: pipelineProp, operator: "EQ", value: String(pipelineId) }]);
+  }
+
+  // Map + dedupe
+  const seen = new Set();
+  const mapped = [];
+
+  for (const r of results || []) {
     const id = String(r.id);
+    if (seen.has(id)) continue;
+    seen.add(id);
+
     const props = r.properties || {};
     const label =
-      recordType === "deal" ? props.dealname || `Deal ${id}` : props.subject || `Ticket ${id}`;
-    return { id, label };
-  });
+      recordType === "deal"
+        ? props.dealname || `Deal ${id}`
+        : props.subject || `Ticket ${id}`;
+
+    mapped.push({ id, label });
+  }
+
+  return mapped;
 }
 
 async function hsGetNoteAssociationTypeId(toObjectTypePlural) {
