@@ -1546,6 +1546,113 @@ app.view("hubnote_attach_modal_submit", async ({ ack, body, view, client, logger
   }
 });
 
+// HubSpot Note v2 modal submission
+app.view('hubnote_modal_submit_v2', async ({ ack, body, view, client, logger }) => {
+  const safeJsonParseLocal = (str, fallback = {}) => {
+    try {
+      if (!str || typeof str !== 'string') return fallback;
+      return JSON.parse(str);
+    } catch (_) {
+      return fallback;
+    }
+  };
+
+  // Ack quickly; do work after.
+  try {
+    const getSelectedOptionValue = (actionId) => {
+      const values = view?.state?.values || {};
+      for (const block of Object.values(values)) {
+        if (block && block[actionId] && block[actionId].selected_option) {
+          return block[actionId].selected_option.value;
+        }
+      }
+      return null;
+    };
+
+    const getPlainTextValue = (actionId) => {
+      const values = view?.state?.values || {};
+      for (const block of Object.values(values)) {
+        if (block && block[actionId] && typeof block[actionId].value === 'string') {
+          return block[actionId].value;
+        }
+      }
+      return null;
+    };
+
+    const meta = safeJsonParseLocal(view?.private_metadata || '{}', {});
+
+    const recordType = getSelectedOptionValue('hubnote_v2_record_type_select') || meta.recordType || 'ticket';
+    const pipelineId = getSelectedOptionValue('hubnote_v2_pipeline_select') || meta.pipelineId || '';
+    const stageId = getSelectedOptionValue('hubnote_v2_stage_select') || meta.stageId || '';
+    const recordId = getSelectedOptionValue('hubnote_v2_record_select') || '';
+
+    const noteTitle = (getPlainTextValue('hubnote_v2_note_title_input') || '').trim();
+    const noteBody = (getPlainTextValue('hubnote_v2_note_body_input') || '').trim();
+
+    const errors = {};
+    if (!recordId) errors['record_block_v2'] = 'Please select a record.';
+    if (!noteTitle) errors['note_title_block_v2'] = 'Please enter a note title / subject.';
+    if (!noteBody) errors['note_body_block_v2'] = 'Please enter a note body.';
+
+    if (Object.keys(errors).length) {
+      return await ack({ response_action: 'errors', errors });
+    }
+
+    await ack();
+
+    const correlationId = meta.correlationId || `hubnote_${Date.now()}`;
+    const originChannelId = meta.originChannelId || body?.channel?.id;
+    const originUserId = meta.originUserId || body?.user?.id;
+
+    const result = await hsCreateNoteAndAssociate({
+      hubspot_object_type: recordType, // "ticket" | "deal"
+      hubspot_object_id: recordId,
+      note_title: noteTitle,
+      note_body: noteBody,
+    });
+
+    try {
+      if (originChannelId && originUserId) {
+        await client.chat.postEphemeral({
+          channel: originChannelId,
+          user: originUserId,
+          text: `✅ HubSpot note created and attached to ${recordType} ${recordId}.`,
+        });
+      }
+    } catch (e) {
+      logger?.warn?.(`[HubNote] Unable to post confirmation: ${e?.message || e}`);
+    }
+
+    logger.info(
+      `[HubNote] Submitted v2 note. correlationId=${correlationId} recordType=${recordType} recordId=${recordId} pipelineId=${pipelineId} stageId=${stageId}`
+    );
+
+    return result;
+  } catch (e) {
+    logger.error(e);
+
+    // Try to notify user, but don't throw.
+    try {
+      const meta = safeJsonParseLocal(view?.private_metadata || '{}', {});
+      const originChannelId = meta.originChannelId || body?.channel?.id;
+      const originUserId = meta.originUserId || body?.user?.id;
+      if (originChannelId && originUserId) {
+        await client.chat.postEphemeral({
+          channel: originChannelId,
+          user: originUserId,
+          text: `❌ Sorry — I couldn't create that HubSpot note. Please try again, and if it keeps failing, share the timestamp from the app logs.`,
+        });
+      }
+    } catch (_) {}
+
+    try {
+      await ack();
+    } catch (_) {}
+  }
+});
+
+
+
 // ==============================
 // START SERVER
 // ==============================
