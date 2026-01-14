@@ -84,7 +84,9 @@ receiver.app.get("/", (req, res) => res.status(200).send("OK"));
 const HUBSPOT_TOKEN = process.env.HUBSPOT_PRIVATE_APP_TOKEN || "";
 
 // Optional: protect this endpoint (recommended). If set, Zapier must send header x-zapier-secret
-const ZAPIER_HUBNOTE_SECRET = process.env.ZAPIER_HUBNOTE_SECRET || "";
+if (req.headers["x-zapier-secret"] !== HUBNOTE_ZAPIER_SECRET) {
+  return res.status(401).json({ error: "unauthorized" });
+}
 
 function hsPlural(type) {
   return type === "deal" ? "deals" : "tickets";
