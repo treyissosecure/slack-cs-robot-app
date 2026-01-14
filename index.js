@@ -1218,6 +1218,227 @@ app.action("hubnote_add_files_yes", async ({ ack, body, client, logger }) => {
 });
 
 // ==============================
+// HUBNOTE V2 — OPTIONS LOADERS (Pipeline / Stage / Record)
+// Paste AFTER hsGetPipelines + hsSearchRecords exist, BEFORE app.start()
+// ==============================
+
+// Pipeline dropdown options
+app.options("hubnote_v2_pipeline_select", async ({ body, options, ack, logger }) => {
+  try {
+    const meta = parsePrivateMetadata(body?.view?.private_metadata);
+    const recordType = meta.recordType || "ticket";
+    const q = (options?.value || "").trim().toLowerCase();
+
+    const pipelines = await hsGetPipelines(recordType);
+
+    const opts = (pipelines || [])
+      .filter((p) => !q || (p.label || "").toLowerCase().includes(q))
+      .slice(0, 100)
+      .map((p) => ({
+        text: { type: "plain_text", text: String(p.label).slice(0, 75) },
+        value: String(p.id),
+      }));
+
+    if (!opts.length) {
+      return await ack({
+        options: [
+          {
+            text: { type: "plain_text", text: "No pipelines found (check HubSpot token/scopes)" },
+            value: "NO_PIPELINES",
+          },
+        ],
+      });
+    }
+
+    return await ack({ options: opts });
+  } catch (e) {
+    logger.error(e);
+    return await ack({
+      options: [
+        {
+          text: { type: "plain_text", text: "ERROR loading pipelines (check Render logs)" },
+          value: "ERROR_PIPELINES",
+        },
+      ],
+    });
+  }
+});
+
+// Stage dropdown options (depends on pipelineId)
+app.options("hubnote_v2_stage_select", async ({ body, options, ack, logger }) => {
+  try {
+    const meta = parsePrivateMetadata(body?.view?.private_metadata);
+    const recordType = meta.recordType || "ticket";
+    const pipelineId = meta.pipelineId || "";
+    const q = (options?.value || "").trim().toLowerCase();
+
+    if (!pipelineId) {
+      return await ack({
+        options: [
+          { text: { type: "plain_text", text: "Select a pipeline first" }, value: "SELECT_PIPELINE_FIRST" },
+        ],
+      });
+    }
+
+    const pipelines = await hsGetPipelines(recordType);
+    const pipeline = (pipelines || []).find((p) => String(p.id) === String(pipelineId));
+    const stages = pipeline?.stages || [];
+
+    const opts = stages
+      .filter((s) => !q || (s.label || "").toLowerCase().includes(q))
+      .slice(0, 100)
+      .map((s) => ({
+        text: { type: "plain_text", text: String(s.label).slice(0, 75) },
+        value: String(s.id),
+      }));
+
+    if (!opts.length) {
+      return await ack({
+        options: [
+          { text: { type: "plain_text", text: "No stages found for this pipeline" }, value: "NO_STAGES" },
+        ],
+      });
+    }
+
+    return await ack({ options: opts });
+  } catch (e) {
+    logger.error(e);
+    return await ack({
+      options: [
+        { text: { type: "plain_text", text: "ERROR loading stages (check Render logs)" }, value: "ERROR_STAGES" },
+      ],
+    });
+  }
+});
+
+// Record dropdown options (depends on pipelineId + stageId)
+app.options("hubnote_v2_record_select", async ({ body, options, ack, logger }) => {
+  try {
+    const meta = parsePrivateMetadata(body?.view?.private_metadata);
+    const recordType = meta.recordType || "ticket";
+    const pipelineId = meta.pipelineId || "";
+    const stageId = meta.stageId || "";
+    const q = options?.value || "";
+
+    if (!pipelineId) {
+      return await ack({
+        options: [
+          { text: { type: "plain_text", text: "Select a pipeline first" }, value: "SELECT_PIPELINE_FIRST" },
+        ],
+      });
+    }
+    if (!stageId) {
+      return await ack({
+        options: [
+          { text: { type: "plain_text", text: "Select a stage first" }, value: "SELECT_STAGE_FIRST" },
+        ],
+      });
+    }
+
+    const records = await hsSearchRecords({ recordType, pipelineId, stageId, query: q });
+
+    const opts = (records || []).slice(0, 100).map((r) => ({
+      text: { type: "plain_text", text: String(r.label).slice(0, 75) },
+      value: String(r.id),
+    }));
+
+    if (!opts.length) {
+      return await ack({
+        options: [
+          { text: { type: "plain_text", text: "No records match that search" }, value: "NO_RECORDS" },
+        ],
+      });
+    }
+
+    return await ack({ options: opts });
+  } catch (e) {
+    logger.error(e);
+    return await ack({
+      options: [
+        { text: { type: "plain_text", text: "ERROR loading records (check Render logs)" }, value: "ERROR_RECORDS" },
+      ],
+    });
+  }
+});
+
+// ==============================
+// HUBNOTE V2 — ACTION HANDLERS (store selections + reset downstream)
+// These make “changing pipeline” correctly clears stage/record so it refreshes.
+// ==============================
+
+app.action("hubnote_v2_record_type_select", async ({ ack, body, client, logger }) => {
+  await ack();
+  try {
+    const selected = body?.actions?.[0]?.selected_option?.value || "ticket";
+    const view = body?.view;
+    if (!view?.id) return;
+
+    const meta = parsePrivateMetadata(view.private_metadata);
+    meta.recordType = selected;
+
+    // reset downstream
+    meta.pipelineId = "";
+    meta.stageId = "";
+    meta.recordId = "";
+
+    await client.views.update({
+      view_id: view.id,
+      hash: view.hash,
+      view: buildCleanViewPayload(view, JSON.stringify(meta)),
+    });
+  } catch (e) {
+    logger.error(e);
+  }
+});
+
+app.action("hubnote_v2_pipeline_select", async ({ ack, body, client, logger }) => {
+  await ack();
+  try {
+    const selected = body?.actions?.[0]?.selected_option?.value || "";
+    const view = body?.view;
+    if (!view?.id) return;
+
+    const meta = parsePrivateMetadata(view.private_metadata);
+    meta.pipelineId = selected;
+
+    // reset downstream
+    meta.stageId = "";
+    meta.recordId = "";
+
+    await client.views.update({
+      view_id: view.id,
+      hash: view.hash,
+      view: buildCleanViewPayload(view, JSON.stringify(meta)),
+    });
+  } catch (e) {
+    logger.error(e);
+  }
+});
+
+app.action("hubnote_v2_stage_select", async ({ ack, body, client, logger }) => {
+  await ack();
+  try {
+    const selected = body?.actions?.[0]?.selected_option?.value || "";
+    const view = body?.view;
+    if (!view?.id) return;
+
+    const meta = parsePrivateMetadata(view.private_metadata);
+    meta.stageId = selected;
+
+    // reset downstream
+    meta.recordId = "";
+
+    await client.views.update({
+      view_id: view.id,
+      hash: view.hash,
+      view: buildCleanViewPayload(view, JSON.stringify(meta)),
+    });
+  } catch (e) {
+    logger.error(e);
+  }
+});
+
+// ==============================
 // Options loader: Slack file search (requires files:read scope)
 // ==============================
 app.options("hubnote_files_select", async ({ ack, body, options, client, logger }) => {
