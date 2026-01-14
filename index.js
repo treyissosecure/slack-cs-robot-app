@@ -678,46 +678,64 @@ async function hsSearchRecords({
   const stageProp = recordType === "deal" ? HS_DEAL_STAGE_PROP : HS_TICKET_STAGE_PROP;
 
   // Build filters (HubSpot CRM search API)
-  const filterGroups = [];
+  // Use a SINGLE filter group (AND). Multiple groups are OR'ed and can cause surprises.
+  const filters = [];
 
-  // Always include pipeline filter when provided (your UI requires pipeline before stage/record)
   if (pipelineId !== undefined && pipelineId !== null && String(pipelineId).length > 0) {
-    filterGroups.push({
-      filters: [{ propertyName: pipelineProp, operator: "EQ", value: String(pipelineId) }],
-    });
+    filters.push({ propertyName: pipelineProp, operator: "EQ", value: String(pipelineId) });
   }
 
   if (stageId !== undefined && stageId !== null && String(stageId).length > 0) {
-    // Add stage filter in the same group (AND)
-    if (filterGroups.length === 0) filterGroups.push({ filters: [] });
-    filterGroups[0].filters.push({ propertyName: stageProp, operator: "EQ", value: String(stageId) });
+    filters.push({ propertyName: stageProp, operator: "EQ", value: String(stageId) });
   }
 
-  // If the user typed something, add a "contains token" type filter on a human-readable field
+  // If the user typed something, add a "contains token" filter on a human-readable field
   // Tickets: subject; Deals: dealname
   if (q.length > 0) {
     const nameProp = recordType === "deal" ? "dealname" : "subject";
-    // Put the text search in the same group for AND behavior
-    if (filterGroups.length === 0) filterGroups.push({ filters: [] });
-    filterGroups[0].filters.push({ propertyName: nameProp, operator: "CONTAINS_TOKEN", value: q });
+    filters.push({ propertyName: nameProp, operator: "CONTAINS_TOKEN", value: q });
   }
 
   const properties =
     recordType === "deal" ? HS_DEAL_DISPLAY_PROPS : HS_TICKET_DISPLAY_PROPS;
 
   const payload = {
-    filterGroups: filterGroups.length ? filterGroups : [{ filters: [] }],
+    filterGroups: [{ filters }],
     sorts: [],
     properties,
     limit: Math.min(Math.max(Number(limit) || 25, 1), 100),
-    after: 0,
   };
 
   try {
     log.debug("[HubSpot] search payload:", safeJson(payload));
-    const data = await hubspotRequest("POST", `/crm/v3/objects/${objectType}/search`, payload);
+    const runSearch = async (filtersOverride) => {
+      const body = {
+        ...payload,
+        filterGroups: [{ filters: filtersOverride }],
+      };
+      log.debug("[HubSpot] search payload:", safeJson(body));
+      const data = await hubspotRequest("POST", `/crm/v3/objects/${objectType}/search`, body);
+      return Array.isArray(data?.results) ? data.results : [];
+    };
 
-    const results = Array.isArray(data?.results) ? data.results : [];
+    // First attempt: pipeline + stage + optional query
+    let results = await runSearch(filters);
+
+    // Fallback 1: if stage filter is too restrictive, retry without stage
+    if (results.length === 0 && stageId) {
+      const noStage = filters.filter((f) => f.propertyName !== stageProp);
+      results = await runSearch(noStage);
+    }
+
+    // Fallback 2: if still empty, retry with only query (or no filters)
+    if (results.length === 0) {
+      const queryOnly = filters.filter((f) => {
+        const nameProp = recordType === "deal" ? "dealname" : "subject";
+        return f.propertyName === nameProp;
+      });
+      results = await runSearch(queryOnly);
+    }
+
     hsCacheSet(cacheKey, results);
     return results;
   } catch (err) {
