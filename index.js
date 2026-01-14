@@ -1118,6 +1118,170 @@ app.view("hubnote_modal_submit_v2", async ({ ack, body, view, client, logger }) 
 // ------------------------------
 // Zapier -> SyllaBot callback -> ephemeral Yes/No
 // ------------------------------
+// ==============================
+// NEW: Zapier -> SyllaBot middleware endpoint
+// POST /api/hubnote/create
+// Creates a HubSpot note + associates it to a Ticket or Deal.
+// ==============================
+
+const HS_ASSOC_CACHE_MS = 60 * 60 * 1000; // 1 hour
+const hsAssocCache = {
+  deal: { at: 0, associationTypeId: null },
+  ticket: { at: 0, associationTypeId: null },
+};
+
+function hsPlural(type) {
+  // HubSpot object names for endpoints
+  if (type === "deal") return "deals";
+  return "tickets";
+}
+
+function buildHubspotNoteBody(noteTitle, noteBody) {
+  const title = (noteTitle || "").trim();
+  const body = (noteBody || "").trim();
+
+  // HubSpot Notes UI doesn’t always show a “title” field consistently,
+  // so we embed title at top for reliable UX.
+  if (title && body) return `**${title}**\n\n${body}`;
+  if (title && !body) return `**${title}**`;
+  return body;
+}
+
+async function hsGetAssociationTypeIdForNote(toType /* "deal"|"ticket" */) {
+  const cached = hsAssocCache[toType];
+  const now = Date.now();
+  if (cached?.associationTypeId && now - cached.at < HS_ASSOC_CACHE_MS) {
+    return cached.associationTypeId;
+  }
+
+  const toPlural = hsPlural(toType);
+
+  // HubSpot association labels endpoint:
+  // GET /crm/v4/objects/notes/{toPlural}/labels
+  const data = await hubspotRequest(
+    "GET",
+    `/crm/v4/objects/notes/${toPlural}/labels`
+  );
+
+  const results = data?.results || [];
+
+  // Try to choose the default-ish association
+  // (HubSpot returns multiple labels in some portals)
+  const pick =
+    results.find((r) => !r.label) ||
+    results.find((r) => String(r.label || "").toLowerCase() === "default") ||
+    results[0];
+
+  const associationTypeId = pick?.typeId || pick?.associationTypeId || null;
+
+  if (!associationTypeId) {
+    throw new Error(
+      `Could not determine association typeId for notes -> ${toPlural}. HubSpot returned: ${JSON.stringify(
+        results
+      )}`
+    );
+  }
+
+  hsAssocCache[toType] = { at: now, associationTypeId };
+  return associationTypeId;
+}
+
+receiver.app.post("/api/hubnote/create", express.json(), async (req, res) => {
+  try {
+    // Optional auth: if you set ZAPIER_HUBNOTE_SECRET in Render,
+    // Zapier should send header x-zapier-secret with that value.
+    if (ZAPIER_HUBNOTE_SECRET) {
+      const incoming = req.headers["x-zapier-secret"];
+      if (!incoming || incoming !== ZAPIER_HUBNOTE_SECRET) {
+        return res.status(401).json({ ok: false, error: "unauthorized" });
+      }
+    }
+
+    const {
+      correlation_id,
+      hubspot_object_type, // "ticket" | "deal"
+      hubspot_object_id,   // record id
+      note_title,
+      note_body,
+      submitted_by_slack_user_id,
+      submitted_at,
+      origin_channel_id,
+      origin_user_id,
+    } = req.body || {};
+
+    // Validate required inputs
+    const missing = [];
+    if (!hubspot_object_type) missing.push("hubspot_object_type");
+    if (!hubspot_object_id) missing.push("hubspot_object_id");
+    if (!origin_channel_id) missing.push("origin_channel_id");
+    if (!origin_user_id) missing.push("origin_user_id");
+
+    if (missing.length) {
+      return res.status(400).json({
+        ok: false,
+        error: `missing ${missing.join(", ")}`,
+      });
+    }
+
+    const recordType = String(hubspot_object_type).toLowerCase() === "deal" ? "deal" : "ticket";
+    const recordId = String(hubspot_object_id);
+
+    const hsBody = buildHubspotNoteBody(note_title, note_body);
+
+    // Create note
+    const createNotePayload = {
+      properties: {
+        hs_note_body: hsBody,
+        hs_timestamp: String(Date.now()),
+      },
+    };
+
+    const created = await hubspotRequest(
+      "POST",
+      "/crm/v3/objects/notes",
+      createNotePayload
+    );
+
+    const noteId = created?.id ? String(created.id) : null;
+    if (!noteId) {
+      throw new Error(`HubSpot note create returned no id: ${JSON.stringify(created)}`);
+    }
+
+    // Associate note -> ticket/deal
+    const toPlural = hsPlural(recordType);
+    const associationTypeId = await hsGetAssociationTypeIdForNote(recordType);
+
+    // PUT /crm/v4/objects/notes/{noteId}/associations/{toPlural}/{recordId}/{associationTypeId}
+    await hubspotRequest(
+      "PUT",
+      `/crm/v4/objects/notes/${noteId}/associations/${toPlural}/${recordId}/${associationTypeId}`
+    );
+
+    // Respond for Zapier Step 3 callback mapping
+    return res.status(200).json({
+      ok: true,
+      status: "success",
+      correlation_id: correlation_id || "",
+      hubspot_note_id: noteId,
+      hubspot_object_type: recordType,
+      hubspot_object_id: recordId,
+      origin_channel_id,
+      origin_user_id,
+      submitted_by_slack_user_id: submitted_by_slack_user_id || "",
+      submitted_at: submitted_at || "",
+    });
+  } catch (e) {
+    console.error("[api/hubnote/create] error:", e?.message || e);
+
+    // IMPORTANT: return JSON so Zapier can show something useful
+    return res.status(500).json({
+      ok: false,
+      status: "error",
+      error: e?.message || "server_error",
+    });
+  }
+});
+
 receiver.app.post("/zapier/hubnote/callback", express.json(), async (req, res) => {
   try {
     if (ZAPIER_HUBNOTE_SECRET) {
