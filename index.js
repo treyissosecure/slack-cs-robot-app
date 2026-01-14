@@ -633,64 +633,68 @@ async function hsSearchRecords({ recordType, pipelineId, stageId, query }) {
 
   const q = (query || "").trim();
 
-  // Primary: server-side filtered search (fast/accurate when HS accepts filters)
-  const primaryBody = {
-    filterGroups: [
-      {
-        filters: [
-          { propertyName: pipelineProp, operator: "EQ", value: String(pipelineId) },
-          { propertyName: stageProp, operator: "EQ", value: String(stageId) },
-        ],
-      },
-    ],
-    properties,
-    limit: 50,
-  };
-  if (q) primaryBody.query = q;
+  async function runSearch(filters, limit = 100, maxPages = 3) {
+    const items = [];
+    let after = undefined;
 
-  const primary = await hubspotRequest(
-    "POST",
-    `/crm/v3/objects/${objectType}/search`,
-    primaryBody
-  );
+    for (let page = 0; page < maxPages; page++) {
+      const body = {
+        filterGroups: [{ filters }],
+        properties,
+        limit,
+      };
+      if (q) body.query = q;
+      if (after !== undefined) body.after = after;
 
-  let results = primary?.results || [];
+      const data = await hubspotRequest("POST", `/crm/v3/objects/${objectType}/search`, body);
+      const results = data?.results || [];
+      items.push(...results);
 
-  // Fallback: HubSpot can be picky about filtering on pipeline/stage for some portals.
-  // If primary returns nothing, do an unfiltered search (sorted by last modified),
-  // then filter client-side by the same pipeline + stage values.
-  if (!results.length && !q) {
-    const fallbackBody = {
-      properties,
-      limit: 100,
-      sorts: ["-hs_lastmodifieddate"],
-    };
+      after = data?.paging?.next?.after;
+      if (!after) break;
+    }
 
-    const fallback = await hubspotRequest(
-      "POST",
-      `/crm/v3/objects/${objectType}/search`,
-      fallbackBody
-    );
-
-    const all = fallback?.results || [];
-    const p = String(pipelineId);
-    const s = String(stageId);
-
-    results = all.filter((r) => {
-      const props = r.properties || {};
-      return String(props[pipelineProp] ?? "") === p && String(props[stageProp] ?? "") === s;
-    });
+    return items;
   }
 
-  return results.map((r) => {
+  // Preferred: pipeline + stage (most specific)
+  const filtersPreferred = [];
+  if (pipelineId) filtersPreferred.push({ propertyName: pipelineProp, operator: "EQ", value: String(pipelineId) });
+  if (stageId) filtersPreferred.push({ propertyName: stageProp, operator: "EQ", value: String(stageId) });
+
+  let results = [];
+  if (filtersPreferred.length) {
+    results = await runSearch(filtersPreferred);
+  }
+
+  // Fallbacks (HubSpot data can be weird across pipelines/stages; also helps if the stage id in Slack is stale)
+  if ((!results || results.length === 0) && stageId) {
+    results = await runSearch([{ propertyName: stageProp, operator: "EQ", value: String(stageId) }]);
+  }
+
+  if ((!results || results.length === 0) && pipelineId) {
+    results = await runSearch([{ propertyName: pipelineProp, operator: "EQ", value: String(pipelineId) }]);
+  }
+
+  // Map + dedupe
+  const seen = new Set();
+  const mapped = [];
+
+  for (const r of results || []) {
     const id = String(r.id);
+    if (seen.has(id)) continue;
+    seen.add(id);
+
     const props = r.properties || {};
     const label =
       recordType === "deal"
         ? props.dealname || `Deal ${id}`
         : props.subject || `Ticket ${id}`;
-    return { id, label };
-  });
+
+    mapped.push({ id, label });
+  }
+
+  return mapped;
 }
 
 async function hsGetNoteAssociationTypeId(toObjectTypePlural) {
