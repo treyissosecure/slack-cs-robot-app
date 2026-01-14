@@ -31,9 +31,9 @@ const crypto = require("crypto");
 // HubSpot default property internal names (allow override via env)
 const HS_TICKET_PIPELINE_PROP = process.env.HS_TICKET_PIPELINE_PROP || "hs_pipeline";
 const HS_TICKET_STAGE_PROP    = process.env.HS_TICKET_STAGE_PROP    || "hs_pipeline_stage";
-
 const HS_DEAL_PIPELINE_PROP   = process.env.HS_DEAL_PIPELINE_PROP   || "pipeline";
 const HS_DEAL_STAGE_PROP      = process.env.HS_DEAL_STAGE_PROP      || "dealstage";
+const logger = console;
 
 // ==============================
 // CONFIG
