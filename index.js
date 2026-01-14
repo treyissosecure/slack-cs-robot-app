@@ -1310,11 +1310,6 @@ app.view("hubnote_modal_submit_v2", async ({ ack, body, view, client, logger }) 
 // Creates a HubSpot note + associates it to a Ticket or Deal.
 // ==============================
 
-const hsAssocCache = {
-  deal: { at: 0, associationTypeId: null },
-  ticket: { at: 0, associationTypeId: null },
-};
-
 function hsPlural(type) {
   // HubSpot object names for endpoints
   if (type === "deal") return "deals";
