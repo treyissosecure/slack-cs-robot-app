@@ -610,6 +610,13 @@ const HS_DEAL_STAGE_PROP = "dealstage";
 const HS_DEAL_PIPELINE_PROP = "pipeline";
 const HS_TICKET_PIPELINE_PROP = "hs_pipeline";
 
+// Properties we request from HubSpot search endpoints so we can build a helpful
+// label in the Slack external_select results list.
+// Keep these conservative (common/default props) to avoid 400s when a portal
+// doesn't have custom props.
+const HS_TICKET_DISPLAY_PROPS = ["subject", HS_TICKET_PIPELINE_PROP, HS_TICKET_STAGE_PROP];
+const HS_DEAL_DISPLAY_PROPS = ["dealname", HS_DEAL_PIPELINE_PROP, HS_DEAL_STAGE_PROP, "amount"];
+
 function hsApiObjectType(recordType) {
   return recordType === "deal" ? "deals" : "tickets";
 }
