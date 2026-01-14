@@ -1,11 +1,12 @@
 /**
  * index.js — SyllaBot (Render)
  *
- * ✅ /cstask (UNCHANGED logic: Monday board/group/status/priority + Zapier webhook)
- * ✅ /hubnote v2 modal (Record Type → Pipeline → Stage → Record)
- * ✅ Zapier Step 2: POST /api/hubnote/create  (HubSpot note + association)
- * ✅ Zapier Step 3: POST /zapier/hubnote/callback (ephemeral “Add files?”)
- * ✅ FIXED: Green “Yes” button now works reliably (no DM open dependency). It opens an Attach Files modal directly.
+ * ✅ /cstask: Monday task modal + sends to Zapier webhook
+ * ✅ /hubnote v2: HubSpot note modal (Record Type → Pipeline → Stage → Record)
+ * ✅ Zapier middleware endpoints:
+ *    - POST /api/hubnote/create
+ *    - POST /zapier/hubnote/callback
+ * ✅ “Add files?” Yes button opens an Attach Files modal (and confirms upload).
  *
  * -------------------------------------------------------
  * Required ENV VARS (Render)
@@ -13,16 +14,14 @@
  * SLACK_SIGNING_SECRET
  * SLACK_BOT_TOKEN
  * MONDAY_API_TOKEN
- * ZAPIER_WEBHOOK_URL                    (for /cstask)
+ * ZAPIER_WEBHOOK_URL                 (used by /cstask)
  *
- * HUBSPOT_PRIVATE_APP_TOKEN             (HubSpot private app token)
- *
- * Optional (recommended if you want auth between Zapier ↔ SyllaBot):
- * HUBNOTE_ZAPIER_SECRET                 (Zap Step 2 header x-zapier-secret must match)
- * ZAPIER_HUBNOTE_SECRET                 (Zap Step 3 header x-zapier-secret must match)
+ * HUBSPOT_PRIVATE_APP_TOKEN          (used by /api/hubnote/create)
  *
  * Optional:
- * ZAPIER_HUBNOTE_TRIGGER_URL            (if /hubnote trigger Catch Hook is different than ZAPIER_WEBHOOK_URL)
+ * ZAPIER_HUBNOTE_TRIGGER_URL         (if /hubnote should hit a different Catch Hook)
+ * HUBNOTE_ZAPIER_SECRET              (if set, Zap Step 2 must send header x-zapier-secret)
+ * ZAPIER_HUBNOTE_SECRET              (if set, Zap Step 3 must send header x-zapier-secret)
  */
 
 const { App, ExpressReceiver, LogLevel } = require("@slack/bolt");
@@ -33,40 +32,22 @@ const crypto = require("crypto");
 // ==============================
 // CONFIG
 // ==============================
-const ZAPIER_WEBHOOK_URL =
-  process.env.ZAPIER_WEBHOOK_URL ||
-  "https://hooks.zapier.com/hooks/catch/25767132/ug29zll/";
+const PORT = process.env.PORT || 10000;
 
+const ZAPIER_WEBHOOK_URL = process.env.ZAPIER_WEBHOOK_URL || "";
 const ZAPIER_HUBNOTE_TRIGGER_URL = process.env.ZAPIER_HUBNOTE_TRIGGER_URL || "";
 
-const MONDAY_API_TOKEN = process.env.MONDAY_API_TOKEN;
+const MONDAY_API_TOKEN = process.env.MONDAY_API_TOKEN || "";
 
 const HUBSPOT_PRIVATE_APP_TOKEN = process.env.HUBSPOT_PRIVATE_APP_TOKEN || "";
 
-// Optional auth headers
+// Optional auth between Zapier ↔ SyllaBot
 const HUBNOTE_ZAPIER_SECRET =
   process.env.HUBNOTE_ZAPIER_SECRET || process.env.ZAPIER_HUBNOTE_SECRET || "";
 const ZAPIER_HUBNOTE_SECRET = process.env.ZAPIER_HUBNOTE_SECRET || "";
 
-// Monday labels (must match exactly)
-const STATUS_LABELS = [
-  "Not Started",
-  "Working on it",
-  "Blocked",
-  "Pending Review",
-  "Done",
-];
-const PRIORITY_LABELS = ["Low", "Medium", "High"];
-
-function toStaticOptions(labels) {
-  return labels.map((label) => ({
-    text: { type: "plain_text", text: label },
-    value: label,
-  }));
-}
-
 // ==============================
-// REQUEST RECEIVER
+// SLACK RECEIVER
 // ==============================
 const receiver = new ExpressReceiver({
   signingSecret: process.env.SLACK_SIGNING_SECRET,
@@ -76,7 +57,7 @@ const receiver = new ExpressReceiver({
   },
 });
 
-// Basic request logging (keep while debugging)
+// Request logging (safe; keep while debugging)
 receiver.app.use((req, res, next) => {
   console.log(
     "[REQ]",
@@ -90,6 +71,9 @@ receiver.app.use((req, res, next) => {
 
 // Health check
 receiver.app.get("/", (req, res) => res.status(200).send("OK"));
+
+// Body parser for our custom endpoints
+receiver.app.use(express.json({ limit: "2mb" }));
 
 // ==============================
 // BOLT APP
@@ -125,8 +109,8 @@ function buildCleanViewPayload(view, privateMetadataString) {
   };
 }
 
-// Slack view.state.values can shift if block_id changes.
-// This helper finds selected_option.value by action_id regardless of block_id.
+// Slack view.state.values shifts if block_id changes.
+// Find selected_option.value by action_id regardless of block_id.
 function findSelectedOptionValue(viewStateValues, actionId) {
   const blocks = viewStateValues || {};
   for (const blockId of Object.keys(blocks)) {
@@ -145,11 +129,37 @@ function nowIso() {
   return new Date().toISOString();
 }
 
+function requireZapierSecret(req, res, expectedSecret) {
+  if (!expectedSecret) return true; // auth disabled
+  const got = req.headers["x-zapier-secret"];
+  if (got !== expectedSecret) {
+    res.status(401).json({ ok: false, error: "unauthorized" });
+    return false;
+  }
+  return true;
+}
+
 // ==============================
-// MONDAY API HELPERS
+// MONDAY API HELPERS (for /cstask)
 // ==============================
+const STATUS_LABELS = [
+  "Not Started",
+  "Working on it",
+  "Blocked",
+  "Pending Review",
+  "Done",
+];
+const PRIORITY_LABELS = ["Low", "Medium", "High"];
+
+function toStaticOptions(labels) {
+  return labels.map((label) => ({
+    text: { type: "plain_text", text: label },
+    value: label,
+  }));
+}
+
 const CACHE_MS = 60 * 1000;
-const cache = {
+const mondayCache = {
   boards: { at: 0, options: [] },
   groupsByBoard: new Map(),
 };
@@ -180,8 +190,8 @@ async function fetchBoards(search = "") {
   const now = Date.now();
   const s = (search || "").trim().toLowerCase();
 
-  if (!s && cache.boards.options.length && now - cache.boards.at < CACHE_MS) {
-    return cache.boards.options;
+  if (!s && mondayCache.boards.options.length && now - mondayCache.boards.at < CACHE_MS) {
+    return mondayCache.boards.options;
   }
 
   const data = await mondayGraphQL(
@@ -202,7 +212,7 @@ async function fetchBoards(search = "") {
       value: String(b.id),
     }));
 
-  if (!s) cache.boards = { at: now, options };
+  if (!s) mondayCache.boards = { at: now, options };
   return options;
 }
 
@@ -211,8 +221,8 @@ async function fetchGroups(boardId, search = "") {
   const s = (search || "").trim().toLowerCase();
 
   if (!s) {
-    const cached = cache.groupsByBoard.get(boardId);
-    if (cached && cached.options?.length && now - cached.at < CACHE_MS) {
+    const cached = mondayCache.groupsByBoard.get(boardId);
+    if (cached?.options?.length && now - cached.at < CACHE_MS) {
       return cached.options;
     }
   }
@@ -239,36 +249,38 @@ async function fetchGroups(boardId, search = "") {
       value: String(g.id),
     }));
 
-  if (!s) cache.groupsByBoard.set(boardId, { at: now, options });
+  if (!s) mondayCache.groupsByBoard.set(boardId, { at: now, options });
   return options;
 }
 
 // ==============================
-// DYNAMIC DROPDOWNS (Monday external_select)
+// Monday external_select options
 // ==============================
 app.options("board_select", async ({ options, ack, logger }) => {
   try {
     const search = options?.value || "";
     const boardOptions = await fetchBoards(search);
 
-    if (!boardOptions.length) {
-      return await ack({
-        options: [
-          {
-            text: { type: "plain_text", text: "No boards found" },
-            value: "NO_BOARDS_FOUND",
-          },
-        ],
-      });
-    }
-
-    await ack({ options: boardOptions });
+    await ack({
+      options:
+        boardOptions.length > 0
+          ? boardOptions
+          : [
+              {
+                text: { type: "plain_text", text: "No boards found" },
+                value: "NO_BOARDS_FOUND",
+              },
+            ],
+    });
   } catch (e) {
     logger.error(e);
     await ack({
       options: [
         {
-          text: { type: "plain_text", text: "ERROR loading boards (check Render logs)" },
+          text: {
+            type: "plain_text",
+            text: "ERROR loading boards (check Render logs)",
+          },
           value: "ERROR_LOADING_BOARDS",
         },
       ],
@@ -316,24 +328,29 @@ app.options("group_select", async ({ body, options, ack, logger }) => {
 
     const groupOptions = await fetchGroups(boardId, search);
 
-    if (!groupOptions.length) {
-      return await ack({
-        options: [
-          {
-            text: { type: "plain_text", text: "No groups found for this board" },
-            value: "NO_GROUPS_FOUND",
-          },
-        ],
-      });
-    }
-
-    await ack({ options: groupOptions });
+    await ack({
+      options:
+        groupOptions.length > 0
+          ? groupOptions
+          : [
+              {
+                text: {
+                  type: "plain_text",
+                  text: "No groups found for this board",
+                },
+                value: "NO_GROUPS_FOUND",
+              },
+            ],
+    });
   } catch (e) {
     logger.error(e);
     await ack({
       options: [
         {
-          text: { type: "plain_text", text: "ERROR loading groups (check Render logs)" },
+          text: {
+            type: "plain_text",
+            text: "ERROR loading groups (check Render logs)",
+          },
           value: "ERROR_LOADING_GROUPS",
         },
       ],
@@ -342,7 +359,7 @@ app.options("group_select", async ({ body, options, ack, logger }) => {
 });
 
 // ==============================
-// /cstask (KEEP AS-IS BEHAVIOR)
+// /cstask (keep behavior)
 // ==============================
 app.command("/cstask", async ({ ack, body, client, logger }) => {
   await ack();
@@ -434,7 +451,7 @@ app.command("/cstask", async ({ ack, body, client, logger }) => {
     try {
       await client.chat.postMessage({
         channel: body.user_id,
-        text: "❌ I couldn’t open the task form. Please try again or contact an admin.",
+        text: "❌ I couldn’t open the task form. Please try again.",
       });
     } catch (_) {}
   }
@@ -497,7 +514,8 @@ app.view("cstask_modal_submit", async ({ ack, body, view, client, logger }) => {
   if (!ZAPIER_WEBHOOK_URL) {
     await client.chat.postMessage({
       channel: body.user.id,
-      text: "❌ ZAPIER_WEBHOOK_URL is missing. Add it in Render env vars and redeploy.",
+      text:
+        "❌ ZAPIER_WEBHOOK_URL is missing. Add it in Render env vars and redeploy.",
     });
     return;
   }
@@ -538,38 +556,18 @@ app.view("cstask_modal_submit", async ({ ack, body, view, client, logger }) => {
     logger.error(e);
     await client.chat.postMessage({
       channel: body.user.id,
-      text: "❌ I couldn’t send that task to Zapier. Check Zapier + Render logs and try again.",
+      text:
+        "❌ I couldn’t send that task to Zapier. Check Zapier + Render logs and try again.",
     });
   }
 });
 
 // ==============================
-// HUBSPOT HELPERS (HubNote v2)
+// HUBNOTE v2 — modal + HubSpot helpers
 // ==============================
-async function hubspotRequest(method, path, data) {
-  if (!HUBSPOT_PRIVATE_APP_TOKEN) {
-    throw new Error("Missing HUBSPOT_PRIVATE_APP_TOKEN");
-  }
-
-  const url = `https://api.hubapi.com${path}`;
-
-  const res = await axios({
-    method,
-    url,
-    data,
-    headers: {
-      Authorization: `Bearer ${HUBSPOT_PRIVATE_APP_TOKEN}`,
-      "Content-Type": "application/json",
-    },
-    timeout: 20000,
-  });
-  return res.data;
-}
-
-// Pipelines cache
 const HS_CACHE_MS = 10 * 60 * 1000; // 10 min
 const hsCache = {
-  pipelines: new Map(), // key: "ticket"|"deal" -> { at, pipelines:[{id,label,stages:[{id,label}]}] }
+  pipelines: new Map(), // key: "ticket"|"deal" -> { at, pipelines }
   assocTypeId: new Map(), // key: "tickets"|"deals" -> { at, id }
 };
 
@@ -582,11 +580,27 @@ function hsApiObjectType(recordType) {
   return recordType === "deal" ? "deals" : "tickets";
 }
 
+async function hubspotRequest(method, path, data) {
+  if (!HUBSPOT_PRIVATE_APP_TOKEN) throw new Error("Missing HUBSPOT_PRIVATE_APP_TOKEN");
+  const url = `https://api.hubapi.com${path}`;
+  const res = await axios({
+    method,
+    url,
+    data,
+    headers: {
+      Authorization: `Bearer ${HUBSPOT_PRIVATE_APP_TOKEN}`,
+      "Content-Type": "application/json",
+    },
+    timeout: 8000,
+  });
+  return res.data;
+}
+
 async function hsGetPipelines(recordType) {
   const key = recordType === "deal" ? "deal" : "ticket";
   const now = Date.now();
   const cached = hsCache.pipelines.get(key);
-  if (cached && cached.pipelines?.length && now - cached.at < HS_CACHE_MS) {
+  if (cached?.pipelines?.length && now - cached.at < HS_CACHE_MS) {
     return cached.pipelines;
   }
 
@@ -609,18 +623,18 @@ async function hsGetPipelines(recordType) {
 async function hsSearchRecords({ recordType, pipelineId, stageId, query }) {
   const objectType = hsApiObjectType(recordType);
 
-  const stageProp =
-    recordType === "deal" ? HS_DEAL_STAGE_PROP : HS_TICKET_STAGE_PROP;
-
-  const pipelineProp =
-    recordType === "deal" ? HS_PIPELINE_PROP_DEAL : HS_PIPELINE_PROP_TICKET;
+  const stageProp = recordType === "deal" ? HS_DEAL_STAGE_PROP : HS_TICKET_STAGE_PROP;
+  const pipelineProp = recordType === "deal" ? HS_PIPELINE_PROP_DEAL : HS_PIPELINE_PROP_TICKET;
 
   const properties =
     recordType === "deal"
       ? ["dealname", pipelineProp, stageProp]
       : ["subject", pipelineProp, stageProp];
 
-  const body = {
+  const q = (query || "").trim();
+
+  // Primary: server-side filtered search (fast/accurate when HS accepts filters)
+  const primaryBody = {
     filterGroups: [
       {
         filters: [
@@ -630,20 +644,59 @@ async function hsSearchRecords({ recordType, pipelineId, stageId, query }) {
       },
     ],
     properties,
-    limit: 50,
+    limit: 100,
   };
+  if (q) primaryBody.query = q;
 
-  const q = (query || "").trim();
-  if (q) body.query = q;
-
-  const data = await hubspotRequest(
+  const primary = await hubspotRequest(
     "POST",
     `/crm/v3/objects/${objectType}/search`,
-    body
+    primaryBody
   );
 
-  const results = data?.results || [];
-  return results.map((r) => {
+  let results = primary?.results || [];
+
+  // Fallback: HubSpot can be picky about filtering on pipeline/stage for some portals.
+  // If primary returns nothing, do an unfiltered search (sorted by last modified),
+  // then filter client-side by the same pipeline + stage values.
+  
+// If HubSpot search returns 0 results (can happen with some pipeline/stage combos),
+// page through recent records and filter client-side until we find matches.
+if (!results.length && !q && pipelineId && stageId && pipelineProp && stageProp) {
+  try {
+    const p = String(pipelineId);
+    const st = String(stageId);
+
+    const maxPages = 5; // 5 * 100 = 500 recent records
+    let after = undefined;
+    let matches = [];
+
+    for (let i = 0; i < maxPages && matches.length < 50; i++) {
+      const body = {
+        properties,
+        limit: 100,
+        sorts: ["-hs_lastmodifieddate"],
+        ...(after ? { after } : {}),
+      };
+
+      const resp = await hubspotRequest("POST", `/crm/v3/objects/${objectType}/search`, body);
+      const all = resp?.results || [];
+
+      for (const r of all) {
+        const props = r.properties || {};
+        if (String(props[pipelineProp] ?? "") === p && String(props[stageProp] ?? "") === st) {
+          matches.push(r);
+        }
+      }
+
+      after = resp?.paging?.next?.after;
+      if (!after) break;
+    }
+
+    if (matches.length) results = matches;
+  } catch (_) {}
+}
+return results.map((r) => {
     const id = String(r.id);
     const props = r.properties || {};
     const label =
@@ -657,7 +710,7 @@ async function hsSearchRecords({ recordType, pipelineId, stageId, query }) {
 async function hsGetNoteAssociationTypeId(toObjectTypePlural) {
   const now = Date.now();
   const cached = hsCache.assocTypeId.get(toObjectTypePlural);
-  if (cached && cached.id && now - cached.at < HS_CACHE_MS) return cached.id;
+  if (cached?.id && now - cached.at < HS_CACHE_MS) return cached.id;
 
   const data = await hubspotRequest(
     "GET",
@@ -671,22 +724,22 @@ async function hsGetNoteAssociationTypeId(toObjectTypePlural) {
   const chosen = preferred || results[0];
 
   const id = chosen?.typeId;
-  if (!id) throw new Error(`Could not determine association typeId for notes -> ${toObjectTypePlural}`);
+  if (!id) {
+    throw new Error(
+      `Could not determine association typeId for notes -> ${toObjectTypePlural}`
+    );
+  }
 
   hsCache.assocTypeId.set(toObjectTypePlural, { at: now, id: Number(id) });
   return Number(id);
 }
 
-async function hsCreateNoteAndAssociate({
-  hubspot_object_type, // "ticket"|"deal"
-  hubspot_object_id,
-  note_title,
-  note_body,
-}) {
+async function hsCreateNoteAndAssociate({ hubspot_object_type, hubspot_object_id, note_title, note_body }) {
   const toPlural = hubspot_object_type === "deal" ? "deals" : "tickets";
   const assocTypeId = await hsGetNoteAssociationTypeId(toPlural);
 
-  const combinedBody = `**${note_title || "Note"}**\n${note_body || ""}`;
+  // HubSpot note UI: hs_note_body only. We bold title at top.
+  const combinedBody = `**${(note_title || "Note").trim()}**\n${(note_body || "").trim()}`;
 
   const createBody = {
     properties: {
@@ -709,71 +762,529 @@ async function hsCreateNoteAndAssociate({
   const noteId = created?.id;
   if (!noteId) throw new Error("HubSpot note creation failed (no id returned)");
 
-    return {
+  return {
     hubspot_note_id: String(noteId),
     hubspot_object_type,
     hubspot_object_id: String(hubspot_object_id),
   };
 }
 
-// ==============================
-// /api/hubnote/create  (Zap Step 2 target)
-// ==============================
-//
-// Zap Step 2 (Webhooks by Zapier -> Custom Request)
-// POST https://<render>/api/hubnote/create
-// Headers:
-//   Content-Type: application/json
-//   (optional) x-zapier-secret: <HUBNOTE_ZAPIER_SECRET>
-//
-// Body fields expected (from your Step 1 catch hook):
-//  - correlation_id
-//  - hubspot_object_type  ("ticket"|"deal")
-//  - hubspot_object_id
-//  - note_title
-//  - note_body
-//  - submitted_by_slack_user_id
-//  - submitted_at
-//  - origin_channel_id
-//  - origin_user_id
-//
-// Returns JSON for Zap Step 3 to pass into /zapier/hubnote/callback
-//
-receiver.app.post("/api/hubnote/create", express.json(), async (req, res) => {
+function getPlainTextInputValue(viewStateValues, blockId, actionId) {
   try {
-    if (HUBNOTE_ZAPIER_SECRET) {
-      const incoming = req.headers["x-zapier-secret"];
-      if (!incoming || incoming !== HUBNOTE_ZAPIER_SECRET) {
-        return res.status(401).json({ ok: false, error: "unauthorized" });
-      }
+    return viewStateValues?.[blockId]?.[actionId]?.value ?? "";
+  } catch {
+    return "";
+  }
+}
+
+function bump(meta, key) {
+  meta[key] = Number(meta[key] || 0) + 1;
+  return meta[key];
+}
+
+function buildHubnoteModalV2({
+  correlationId,
+  originChannelId,
+  originUserId,
+  recordType = "ticket",
+  pipelineId = "",
+  stageId = "",
+  // nonces used to force Slack to clear dependent selects
+  noncePipeline = 0,
+  nonceStage = 0,
+  nonceRecord = 0,
+  // preserve typed text when we rebuild the view
+  noteTitleInitial = "",
+  noteBodyInitial = "",
+} = {}) {
+  const meta = {
+    correlationId,
+    originChannelId,
+    originUserId,
+    version: "v2",
+    recordType,
+    pipelineId,
+    stageId,
+    noncePipeline,
+    nonceStage,
+    nonceRecord,
+  };
+
+  // Changing block_id forces Slack to discard previous state for that input.
+  const pipelineBlockId = `pipeline_block_v2_${noncePipeline}`;
+  const stageBlockId = `stage_block_v2_${nonceStage}`;
+  const recordBlockId = `record_block_v2_${nonceRecord}`;
+
+  return {
+    type: "modal",
+    callback_id: "hubnote_modal_submit_v2",
+    title: { type: "plain_text", text: "HubSpot Note", emoji: true },
+    submit: { type: "plain_text", text: "Create", emoji: true },
+    close: { type: "plain_text", text: "Cancel", emoji: true },
+    clear_on_close: false,
+    notify_on_close: false,
+    private_metadata: JSON.stringify(meta),
+    blocks: [
+      {
+        type: "input",
+        block_id: "record_type_block_v2",
+        label: { type: "plain_text", text: "Record Type", emoji: true },
+        optional: false,
+        dispatch_action: true,
+        element: {
+          type: "static_select",
+          action_id: "hubnote_v2_record_type_select",
+          placeholder: { type: "plain_text", text: "Ticket or Deal", emoji: true },
+          initial_option: {
+            text: { type: "plain_text", text: recordType === "deal" ? "Deal" : "Ticket", emoji: true },
+            value: recordType === "deal" ? "deal" : "ticket",
+          },
+          options: [
+            { text: { type: "plain_text", text: "Ticket", emoji: true }, value: "ticket" },
+            { text: { type: "plain_text", text: "Deal", emoji: true }, value: "deal" },
+          ],
+        },
+      },
+      {
+        type: "input",
+        block_id: pipelineBlockId,
+        label: { type: "plain_text", text: "Pipeline", emoji: true },
+        optional: false,
+        dispatch_action: true,
+        element: {
+          type: "external_select",
+          action_id: "hubnote_v2_pipeline_select",
+          placeholder: { type: "plain_text", text: "Select a pipeline", emoji: true },
+          min_query_length: 0,
+        },
+      },
+      {
+        type: "input",
+        block_id: stageBlockId,
+        label: { type: "plain_text", text: "Pipeline Stage", emoji: true },
+        optional: false,
+        dispatch_action: true,
+        element: {
+          type: "external_select",
+          action_id: "hubnote_v2_stage_select",
+          placeholder: { type: "plain_text", text: "Select a stage", emoji: true },
+          min_query_length: 0,
+        },
+      },
+      {
+        type: "input",
+        block_id: recordBlockId,
+        label: { type: "plain_text", text: "Record", emoji: true },
+        optional: false,
+        element: {
+          type: "external_select",
+          action_id: "hubnote_v2_record_select",
+          placeholder: { type: "plain_text", text: "Search/select a record", emoji: true },
+          min_query_length: 0,
+        },
+      },
+      {
+        type: "input",
+        block_id: "note_title_block_v2",
+        label: { type: "plain_text", text: "Note Title / Subject", emoji: true },
+        optional: false,
+        element: {
+          type: "plain_text_input",
+          action_id: "hubnote_v2_note_title_input",
+          placeholder: { type: "plain_text", text: "e.g., Call recap", emoji: true },
+          initial_value: noteTitleInitial || undefined,
+        },
+      },
+      {
+        type: "input",
+        block_id: "note_body_block_v2",
+        label: { type: "plain_text", text: "Note Body", emoji: true },
+        optional: false,
+        element: {
+          type: "plain_text_input",
+          action_id: "hubnote_v2_note_body_input",
+          placeholder: { type: "plain_text", text: "Write your note...", emoji: true },
+          multiline: true,
+          initial_value: noteBodyInitial || undefined,
+        },
+      },
+    ],
+  };
+}
+
+// ==============================
+// HUBNOTE v2 COMMAND
+app.command("/hubnote", async ({ ack, body, client, logger }) => {
+  await ack();
+
+  try {
+    // Warm pipelines cache in the background to help options ack within 3s.
+    hsGetPipelines("ticket").catch(() => {});
+    hsGetPipelines("deal").catch(() => {});
+
+    const correlationId = `hubnote_${crypto.randomBytes(12).toString("hex")}`;
+
+    await client.views.open({
+      trigger_id: body.trigger_id,
+      view: buildHubnoteModalV2({
+        correlationId,
+        originChannelId: body.channel_id,
+        originUserId: body.user_id,
+      }),
+    });
+  } catch (e) {
+    logger.error(e);
+    try {
+      await client.chat.postEphemeral({
+        channel: body.channel_id,
+        user: body.user_id,
+        text: "❌ I couldn’t open the HubSpot note form. Please try again.",
+      });
+    } catch (_) {}
+  }
+});
+
+// When Record Type changes, wipe pipeline + stage in metadata so downstream selects refresh.
+app.action("hubnote_v2_record_type_select", async ({ ack, body, client, logger }) => {
+  await ack();
+
+  try {
+    const view = body?.view;
+    if (!view?.id) return;
+
+    const selectedRecordType = body?.actions?.[0]?.selected_option?.value || "ticket";
+
+    const meta = parsePrivateMetadata(view.private_metadata);
+    meta.recordType = selectedRecordType;
+
+    // Reset dependent selects
+    meta.pipelineId = "";
+    meta.stageId = "";
+    bump(meta, "noncePipeline");
+    bump(meta, "nonceStage");
+    bump(meta, "nonceRecord");
+
+    // Preserve any typed text
+    const noteTitleInitial = getPlainTextInputValue(view.state?.values, "note_title_block_v2", "hubnote_v2_note_title_input");
+    const noteBodyInitial = getPlainTextInputValue(view.state?.values, "note_body_block_v2", "hubnote_v2_note_body_input");
+
+    await client.views.update({
+      view_id: view.id,
+      hash: view.hash,
+      view: buildHubnoteModalV2({
+        correlationId: meta.correlationId,
+        originChannelId: meta.originChannelId,
+        originUserId: meta.originUserId,
+        recordType: meta.recordType,
+        pipelineId: meta.pipelineId,
+        stageId: meta.stageId,
+        noncePipeline: meta.noncePipeline,
+        nonceStage: meta.nonceStage,
+        nonceRecord: meta.nonceRecord,
+        noteTitleInitial,
+        noteBodyInitial,
+      }),
+    });
+  } catch (e) {
+    logger.error(e);
+  }
+});
+
+// Pipelines dropdown options
+app.options("hubnote_v2_pipeline_select", async ({ body, options, ack, logger }) => {
+  try {
+    const meta = parsePrivateMetadata(body?.view?.private_metadata);
+    const recordType = meta.recordType || "ticket";
+
+    const cached = hsCache.pipelines.get(recordType)?.pipelines;
+    if (!cached?.length) {
+      // fire-and-forget fetch; show a friendly retry option
+      hsGetPipelines(recordType).catch(() => {});
+      return await ack({
+        options: [option("Loading pipelines… try again", "__loading__")],
+      });
     }
 
-    const body = req.body || {};
-    console.log("[HIT] /api/hubnote/create", {
-      correlation_id: body.correlation_id,
-      hubspot_object_type: body.hubspot_object_type,
-      hubspot_object_id: body.hubspot_object_id,
-      origin_channel_id: body.origin_channel_id,
-      origin_user_id: body.origin_user_id,
+    const q = (options?.value || "").trim().toLowerCase();
+    const matched = cached
+      .filter((p) => !q || (p.label || "").toLowerCase().includes(q))
+      .slice(0, 100)
+      .map((p) => option(p.label, p.id));
+
+    await ack({ options: matched.length ? matched : [option("No results", "__none__")] });
+  } catch (e) {
+    logger.error(e);
+    await ack({ options: [option("Error loading pipelines", "__error__")] });
+  }
+});
+
+// When Pipeline changes, store pipelineId, clear stageId
+app.action("hubnote_v2_pipeline_select", async ({ ack, body, client, logger }) => {
+  await ack();
+
+  try {
+    const view = body?.view;
+    if (!view?.id) return;
+
+    const selectedPipelineId = body?.actions?.[0]?.selected_option?.value || "";
+
+    const meta = parsePrivateMetadata(view.private_metadata);
+    meta.pipelineId = selectedPipelineId;
+
+    // Reset downstream
+    meta.stageId = "";
+    bump(meta, "nonceStage");
+    bump(meta, "nonceRecord");
+
+    const noteTitleInitial = getPlainTextInputValue(view.state?.values, "note_title_block_v2", "hubnote_v2_note_title_input");
+    const noteBodyInitial = getPlainTextInputValue(view.state?.values, "note_body_block_v2", "hubnote_v2_note_body_input");
+
+    await client.views.update({
+      view_id: view.id,
+      hash: view.hash,
+      view: buildHubnoteModalV2({
+        correlationId: meta.correlationId,
+        originChannelId: meta.originChannelId,
+        originUserId: meta.originUserId,
+        recordType: meta.recordType || "ticket",
+        pipelineId: meta.pipelineId,
+        stageId: meta.stageId,
+        noncePipeline: meta.noncePipeline || 0,
+        nonceStage: meta.nonceStage || 0,
+        nonceRecord: meta.nonceRecord || 0,
+        noteTitleInitial,
+        noteBodyInitial,
+      }),
+    });
+  } catch (e) {
+    logger.error(e);
+  }
+});
+
+// Stages dropdown options (dependent on pipelineId)
+app.options("hubnote_v2_stage_select", async ({ body, options, ack, logger }) => {
+  try {
+    const meta = parsePrivateMetadata(body?.view?.private_metadata);
+    const recordType = meta.recordType || "ticket";
+    const pipelineId = meta.pipelineId || "";
+
+    if (!pipelineId || pipelineId === "__loading__") {
+      return await ack({ options: [option("Select a pipeline first", "__select_pipeline__")] });
+    }
+
+    const pipelines = hsCache.pipelines.get(recordType)?.pipelines;
+    if (!pipelines?.length) {
+      hsGetPipelines(recordType).catch(() => {});
+      return await ack({ options: [option("Loading stages… try again", "__loading__")] });
+    }
+
+    const pipeline = pipelines.find((p) => String(p.id) === String(pipelineId));
+    const stages = pipeline?.stages || [];
+
+    const q = (options?.value || "").trim().toLowerCase();
+    const matched = stages
+      .filter((s) => !q || (s.label || "").toLowerCase().includes(q))
+      .slice(0, 100)
+      .map((s) => option(s.label, s.id));
+
+    await ack({ options: matched.length ? matched : [option("No results", "__none__")] });
+  } catch (e) {
+    logger.error(e);
+    await ack({ options: [option("Error loading stages", "__error__")] });
+  }
+});
+
+// When Stage changes, store stageId
+app.action("hubnote_v2_stage_select", async ({ ack, body, client, logger }) => {
+  await ack();
+
+  try {
+    const view = body?.view;
+    if (!view?.id) return;
+
+    const selectedStageId = body?.actions?.[0]?.selected_option?.value || "";
+
+    const meta = parsePrivateMetadata(view.private_metadata);
+    meta.stageId = selectedStageId;
+
+    // Reset downstream record select
+    bump(meta, "nonceRecord");
+
+    const noteTitleInitial = getPlainTextInputValue(view.state?.values, "note_title_block_v2", "hubnote_v2_note_title_input");
+    const noteBodyInitial = getPlainTextInputValue(view.state?.values, "note_body_block_v2", "hubnote_v2_note_body_input");
+
+    await client.views.update({
+      view_id: view.id,
+      hash: view.hash,
+      view: buildHubnoteModalV2({
+        correlationId: meta.correlationId,
+        originChannelId: meta.originChannelId,
+        originUserId: meta.originUserId,
+        recordType: meta.recordType || "ticket",
+        pipelineId: meta.pipelineId || "",
+        stageId: meta.stageId || "",
+        noncePipeline: meta.noncePipeline || 0,
+        nonceStage: meta.nonceStage || 0,
+        nonceRecord: meta.nonceRecord || 0,
+        noteTitleInitial,
+        noteBodyInitial,
+      }),
+    });
+  } catch (e) {
+    logger.error(e);
+  }
+});
+
+// Record dropdown options (dependent on recordType + pipelineId + stageId)
+app.options("hubnote_v2_record_select", async ({ body, options, ack, logger }) => {
+  try {
+    const meta = parsePrivateMetadata(body?.view?.private_metadata);
+    const recordType = meta.recordType || "ticket";
+    const pipelineId = meta.pipelineId || "";
+    const stageId = meta.stageId || "";
+
+    if (!pipelineId || pipelineId === "__loading__") {
+      return await ack({ options: [option("Select a pipeline first", "__select_pipeline__")] });
+    }
+    if (!stageId || stageId === "__loading__") {
+      return await ack({ options: [option("Select a stage first", "__select_stage__")] });
+    }
+
+    const query = options?.value || "";
+
+    // Ensure ack under 3 seconds.
+    const records = await Promise.race([
+      hsSearchRecords({ recordType, pipelineId, stageId, query }),
+      new Promise((_, reject) => setTimeout(() => reject(new Error("timeout")), 2500)),
+    ]);
+
+    const mapped = (records || []).slice(0, 100).map((r) => option(r.label, r.id));
+    await ack({ options: mapped.length ? mapped : [option("No results", "__none__")] });
+  } catch (e) {
+    if (String(e.message || "").includes("timeout")) {
+      return await ack({ options: [option("Search timed out — try again", "__timeout__")] });
+    }
+    logger.error(e);
+    await ack({ options: [option("Error searching records", "__error__")] });
+  }
+});
+
+// ==============================
+// Hubnote submit handler (posts to Zapier Catch Hook)
+// ==============================
+app.view("hubnote_modal_submit_v2", async ({ ack, body, view, client, logger }) => {
+  // ACK ASAP to avoid 3-second error
+  await ack();
+
+  try {
+    const meta = parsePrivateMetadata(view.private_metadata);
+
+    const recordType = meta.recordType || findSelectedOptionValue(view.state.values, "hubnote_v2_record_type_select") || "ticket";
+    const pipelineId = meta.pipelineId || findSelectedOptionValue(view.state.values, "hubnote_v2_pipeline_select") || "";
+    const stageId = meta.stageId || findSelectedOptionValue(view.state.values, "hubnote_v2_stage_select") || "";
+
+    const recordId = findSelectedOptionValue(view.state.values, "hubnote_v2_record_select");
+
+    const noteTitle =
+      view.state.values?.note_title_block_v2?.hubnote_v2_note_title_input?.value?.trim() || "";
+    const noteBody =
+      view.state.values?.note_body_block_v2?.hubnote_v2_note_body_input?.value?.trim() || "";
+
+    const errors = {};
+    if (!pipelineId || pipelineId.startsWith("__")) errors["pipeline_block_v2"] = "Select a pipeline.";
+    if (!stageId || stageId.startsWith("__")) errors["stage_block_v2"] = "Select a stage.";
+    if (!recordId || recordId.startsWith("__")) errors["record_block_v2"] = "Select a record.";
+    if (!noteTitle) errors["note_title_block_v2"] = "Title is required.";
+    if (!noteBody) errors["note_body_block_v2"] = "Body is required.";
+
+    if (Object.keys(errors).length) {
+      // Re-open errors by updating view
+      await client.views.update({
+        view_id: view.id,
+        hash: view.hash,
+        view: {
+          ...buildCleanViewPayload(view, view.private_metadata),
+        },
+      }).catch(() => {});
+
+      // Best-effort ephemeral error
+      await client.chat.postEphemeral({
+        channel: meta.originChannelId || body.user.id,
+        user: body.user.id,
+        text: "⚠️ Please complete all required fields in the modal.",
+      }).catch(() => {});
+      return;
+    }
+
+    const zapUrl = ZAPIER_HUBNOTE_TRIGGER_URL || ZAPIER_WEBHOOK_URL;
+    if (!zapUrl) {
+      await client.chat.postEphemeral({
+        channel: meta.originChannelId || body.user.id,
+        user: body.user.id,
+        text: "❌ Missing ZAPIER_HUBNOTE_TRIGGER_URL (or ZAPIER_WEBHOOK_URL).",
+      });
+      return;
+    }
+
+    const payload = {
+      source: "slack",
+      command_name: "hubnote",
+      version: "v2",
+      correlation_id: meta.correlationId || `hubnote_${crypto.randomBytes(8).toString("hex")}`,
+      hubspot_object_type: recordType,
+      hubspot_object_id: String(recordId),
+      pipeline_id: String(pipelineId),
+      stage_id: String(stageId),
+      note_title: noteTitle,
+      note_body: noteBody,
+      submitted_by_slack_user_id: body.user.id,
+      submitted_at: nowIso(),
+      origin_channel_id: meta.originChannelId || body.user.id,
+      origin_user_id: meta.originUserId || body.user.id,
+    };
+
+    await axios.post(zapUrl, payload, {
+      headers: { "Content-Type": "application/json" },
+      timeout: 10000,
     });
 
-    const correlation_id = String(body.correlation_id || hubnoteMakeId("hubnote"));
-    const hubspot_object_type =
-      body.hubspot_object_type === "deal" ? "deal" : "ticket";
-
-    const hubspot_object_id = String(body.hubspot_object_id || "").trim();
-    const note_title = String(body.note_title || "").trim();
-    const note_body = String(body.note_body || "").trim();
-
-    const origin_channel_id = String(body.origin_channel_id || "").trim();
-    const origin_user_id = String(body.origin_user_id || "").trim();
-
-    if (!hubspot_object_id || !origin_channel_id || !origin_user_id) {
-      return res.status(400).json({
-        ok: false,
-        error: "missing_required_fields",
-        details: "hubspot_object_id, origin_channel_id, origin_user_id required",
+    await client.chat.postEphemeral({
+      channel: payload.origin_channel_id,
+      user: body.user.id,
+      text: "✅ Sent to Zapier. Creating the HubSpot note now…",
+    });
+  } catch (e) {
+    logger.error(e);
+    try {
+      const meta = parsePrivateMetadata(view.private_metadata);
+      await client.chat.postEphemeral({
+        channel: meta.originChannelId || body.user.id,
+        user: body.user.id,
+        text: "❌ Something went wrong sending to Zapier. Check Render logs.",
       });
+    } catch (_) {}
+  }
+});
+
+// ==============================
+// Zapier Step 2 endpoint: create HubSpot note
+// ==============================
+receiver.app.post("/api/hubnote/create", async (req, res) => {
+  if (!requireZapierSecret(req, res, HUBNOTE_ZAPIER_SECRET)) return;
+
+  try {
+    const {
+      correlation_id,
+      hubspot_object_type,
+      hubspot_object_id,
+      note_title,
+      note_body,
+      origin_channel_id,
+      origin_user_id,
+    } = req.body || {};
+
+    if (!correlation_id || !hubspot_object_type || !hubspot_object_id) {
+      return res.status(400).json({ ok: false, error: "missing required fields" });
     }
 
     const created = await hsCreateNoteAndAssociate({
@@ -783,390 +1294,192 @@ receiver.app.post("/api/hubnote/create", express.json(), async (req, res) => {
       note_body,
     });
 
-    // Return what Zap Step 3 needs to call /zapier/hubnote/callback
     return res.status(200).json({
       ok: true,
-      status: "success",
       correlation_id,
       hubspot_note_id: created.hubspot_note_id,
-      hubspot_object_type,
-      hubspot_object_id,
-      origin_channel_id,
-      origin_user_id,
+      hubspot_object_type: created.hubspot_object_type,
+      hubspot_object_id: created.hubspot_object_id,
+      origin_channel_id: origin_channel_id || "",
+      origin_user_id: origin_user_id || "",
     });
   } catch (e) {
-    console.error("[/api/hubnote/create] error:", e?.response?.data || e?.message || e);
-    return res.status(500).json({
-      ok: false,
-      status: "error",
-      message: "hubnote_create_failed",
-      details: e?.response?.data || e?.message || String(e),
-    });
+    console.error("[ERR] /api/hubnote/create", e?.response?.data || e);
+    return res.status(500).json({ ok: false, error: "server_error" });
   }
 });
 
 // ==============================
-// HUBNOTE SESSION STORE + UI
+// Zapier Step 3 endpoint: callback to Slack
 // ==============================
-const HUBNOTE_SESSION_TTL_MS = 15 * 60 * 1000;
-const hubnoteSessions = new Map();
+const hubnoteSessions = new Map(); // sessionId -> { noteId, channelId, userId }
 
-function hubnoteMakeId(prefix = "hn") {
-  return `${prefix}_${crypto.randomBytes(12).toString("hex")}`;
-}
+receiver.app.post("/zapier/hubnote/callback", async (req, res) => {
+  if (!requireZapierSecret(req, res, ZAPIER_HUBNOTE_SECRET)) return;
 
-function hubnoteSetSession(sessionId, data) {
-  hubnoteSessions.set(sessionId, {
-    ...data,
-    sessionId,
-    expiresAt: Date.now() + HUBNOTE_SESSION_TTL_MS,
-  });
-}
-
-function hubnoteGetSession(sessionId) {
-  const s = hubnoteSessions.get(sessionId);
-  if (!s) return null;
-  if (Date.now() > s.expiresAt) {
-    hubnoteSessions.delete(sessionId);
-    return null;
-  }
-  return s;
-}
-
-function hubnoteDeleteSession(sessionId) {
-  hubnoteSessions.delete(sessionId);
-}
-
-function buildHubnoteAddFilesEphemeral({ sessionId }) {
-  return {
-    text: "✅ Note created. Add files to the note?",
-    blocks: [
-      {
-        type: "section",
-        text: { type: "mrkdwn", text: "✅ *Note created.* Add files to the note?" },
-      },
-      {
-        type: "actions",
-        block_id: "hubnote_add_files_actions",
-        elements: [
-          {
-            type: "button",
-            action_id: "hubnote_add_files_yes",
-            style: "primary",
-            text: { type: "plain_text", text: ":meow_nod: Yes" },
-            value: sessionId,
-          },
-          {
-            type: "button",
-            action_id: "hubnote_add_files_no",
-            style: "danger",
-            text: { type: "plain_text", text: ":bear-headshake: No" },
-            value: sessionId,
-          },
-        ],
-      },
-    ],
-  };
-}
-
-function buildHubnoteAttachModal({ sessionId }) {
-  return {
-    type: "modal",
-    callback_id: "hubnote_attach_modal_submit",
-    title: { type: "plain_text", text: "Attach Files" },
-    submit: { type: "plain_text", text: "Attach" },
-    close: { type: "plain_text", text: "Cancel" },
-    private_metadata: JSON.stringify({ sessionId }),
-    blocks: [
-      {
-        type: "section",
-        text: {
-          type: "mrkdwn",
-          text:
-            "Select file(s) to attach.\n\n" +
-            "_Tip: upload the file(s) to Slack first, then search/select them here._",
-        },
-      },
-      {
-        type: "input",
-        block_id: "files_select_block",
-        label: { type: "plain_text", text: "Files to attach" },
-        element: {
-          type: "multi_external_select",
-          action_id: "hubnote_files_select",
-          placeholder: { type: "plain_text", text: "Search your Slack files" },
-          min_query_length: 0,
-        },
-      },
-      {
-        type: "input",
-        optional: true,
-        block_id: "attach_note_block",
-        label: { type: "plain_text", text: "Optional message" },
-        element: {
-          type: "plain_text_input",
-          action_id: "attach_note_input",
-          multiline: true,
-          placeholder: { type: "plain_text", text: "Anything to add about these attachments?" },
-        },
-      },
-    ],
-  };
-}
-
-// ==============================
-// /zapier/hubnote/callback  (Zap Step 3 target)
-// ==============================
-//
-// Zap Step 3 (Webhooks by Zapier -> Custom Request)
-// POST https://<render>/zapier/hubnote/callback
-// Headers:
-//   Content-Type: application/json
-//   (optional) x-zapier-secret: <ZAPIER_HUBNOTE_SECRET>
-//
-// Body should be the JSON returned from Step 2:
-//  - status: "success"
-//  - correlation_id
-//  - hubspot_note_id
-//  - hubspot_object_type
-//  - hubspot_object_id
-//  - origin_channel_id
-//  - origin_user_id
-//
-receiver.app.post("/zapier/hubnote/callback", express.json(), async (req, res) => {
   try {
-    if (ZAPIER_HUBNOTE_SECRET) {
-      const incoming = req.headers["x-zapier-secret"];
-      if (!incoming || incoming !== ZAPIER_HUBNOTE_SECRET) {
-        return res.status(401).json({ ok: false, error: "unauthorized" });
-      }
-    }
-
     const {
-      status,
       correlation_id,
       hubspot_note_id,
-      hubspot_object_type,
-      hubspot_object_id,
       origin_channel_id,
       origin_user_id,
+      hubspot_object_type,
+      hubspot_object_id,
+      status,
     } = req.body || {};
 
     if (!origin_channel_id || !origin_user_id) {
       return res.status(400).json({ ok: false, error: "missing origin_channel_id/origin_user_id" });
     }
 
-    if (status !== "success" || !hubspot_note_id) {
-      await app.client.chat.postEphemeral({
-        channel: origin_channel_id,
-        user: origin_user_id,
-        text: "❌ HubSpot note creation failed. Check Zapier logs for details.",
-      });
-      return res.status(200).json({ ok: true, handled: "failure" });
-    }
-
-    const sessionId = hubnoteMakeId("hubnote_session");
-    hubnoteSetSession(sessionId, {
-      correlationId: correlation_id || "",
-      hubspotNoteId: String(hubspot_note_id),
-      hubspotObjectType: hubspot_object_type === "deal" ? "deal" : "ticket",
-      hubspotObjectId: hubspot_object_id ? String(hubspot_object_id) : "",
-      originChannelId: origin_channel_id,
-      originUserId: origin_user_id,
+    const sessionId = `hubnote_session_${crypto.randomBytes(12).toString("hex")}`;
+    hubnoteSessions.set(sessionId, {
+      correlation_id: correlation_id || "",
+      hubspot_note_id: hubspot_note_id || "",
+      hubspot_object_type: hubspot_object_type || "",
+      hubspot_object_id: hubspot_object_id || "",
+      channelId: origin_channel_id,
+      userId: origin_user_id,
     });
 
+    // Post ephemeral with buttons
     await app.client.chat.postEphemeral({
       channel: origin_channel_id,
       user: origin_user_id,
-      ...buildHubnoteAddFilesEphemeral({ sessionId }),
+      text: "✅ Note created. Add files to the note?",
+      blocks: [
+        {
+          type: "section",
+          text: { type: "mrkdwn", text: "✅ *Note created.* Add files to the note?" },
+        },
+        {
+          type: "actions",
+          block_id: "hubnote_add_files_actions",
+          elements: [
+            {
+              type: "button",
+              action_id: "hubnote_add_files_yes",
+              style: "primary",
+              text: { type: "plain_text", text: ":meow_nod: Yes" },
+              value: sessionId,
+            },
+            {
+              type: "button",
+              action_id: "hubnote_add_files_no",
+              style: "danger",
+              text: { type: "plain_text", text: ":bear-headshake: No" },
+              value: sessionId,
+            },
+          ],
+        },
+      ],
     });
 
-    return res.status(200).json({ ok: true, sessionId });
+    return res.status(200).json({ ok: true, status: status || "success" });
   } catch (e) {
-    console.error("[hubnote callback] error:", e?.message || e);
+    console.error("[ERR] /zapier/hubnote/callback", e?.response?.data || e);
     return res.status(500).json({ ok: false, error: "server_error" });
   }
 });
 
-// ==============================
-// Ephemeral button handlers (YES/NO)
-// ==============================
-app.action("hubnote_add_files_no", async ({ ack, body, client, logger }) => {
+// “No” button
+app.action("hubnote_add_files_no", async ({ ack, body, client }) => {
   await ack();
-  try {
-    const sessionId = body?.actions?.[0]?.value || "";
-    if (sessionId) hubnoteDeleteSession(sessionId);
-
-    const channelId = body?.channel?.id;
-    const userId = body?.user?.id;
-
-    if (channelId && userId) {
-      await client.chat.postEphemeral({
-        channel: channelId,
-        user: userId,
-        text: "✅ All set — no files added.",
-      });
-    }
-  } catch (e) {
-    logger.error(e);
-  }
+  const sessionId = body?.actions?.[0]?.value;
+  const sess = hubnoteSessions.get(sessionId);
+  if (!sess) return;
+  await client.chat.postEphemeral({
+    channel: sess.channelId,
+    user: sess.userId,
+    text: "✅ Got it — no files added.",
+  });
+  hubnoteSessions.delete(sessionId);
 });
 
-// ✅ FIX: YES now opens the Attach modal directly (no DM dependency)
-app.action("hubnote_add_files_yes", async ({ ack, body, client, logger }) => {
+// “Yes” button — open Attach Files modal
+app.action("hubnote_add_files_yes", async ({ ack, body, client }) => {
   await ack();
+  const sessionId = body?.actions?.[0]?.value;
+  const sess = hubnoteSessions.get(sessionId);
+  if (!sess) return;
 
-  try {
-    const sessionId = body?.actions?.[0]?.value || "";
-    const session = hubnoteGetSession(sessionId);
-
-    const channelId = body?.channel?.id;
-    const userId = body?.user?.id;
-
-    if (!session) {
-      if (channelId && userId) {
-        await client.chat.postEphemeral({
-          channel: channelId,
-          user: userId,
-          text: "⚠️ That attachment session expired. Please run /hubnote again if needed.",
-        });
-      }
-      return;
-    }
-
-    // This is critical: views.open needs a trigger_id from the interaction payload
-    if (!body?.trigger_id) {
-      if (channelId && userId) {
-        await client.chat.postEphemeral({
-          channel: channelId,
-          user: userId,
-          text: "⚠️ Slack didn’t provide a trigger_id for this click. Try clicking again.",
-        });
-      }
-      return;
-    }
-
-    await client.views.open({
-      trigger_id: body.trigger_id,
-      view: buildHubnoteAttachModal({ sessionId }),
+  // NOTE: interactive button payload includes trigger_id; use it for views.open
+  const triggerId = body?.trigger_id;
+  if (!triggerId) {
+    await client.chat.postEphemeral({
+      channel: sess.channelId,
+      user: sess.userId,
+      text: "⚠️ Slack didn’t provide a trigger_id. Try again.",
     });
-  } catch (e) {
-    logger.error(e);
+    return;
   }
+
+  await client.views.open({
+    trigger_id: triggerId,
+    view: {
+      type: "modal",
+      callback_id: "hubnote_attach_files_submit",
+      title: { type: "plain_text", text: "Attach files" },
+      submit: { type: "plain_text", text: "Done" },
+      close: { type: "plain_text", text: "Cancel" },
+      private_metadata: JSON.stringify({ sessionId }),
+      blocks: [
+        {
+          type: "section",
+          text: {
+            type: "mrkdwn",
+            text:
+              "Upload files here. I’ll confirm once Slack receives them.\n\n*(Optional: wiring these into HubSpot attachments can come next.)*",
+          },
+        },
+        {
+          type: "input",
+          block_id: "hubnote_files_block",
+          optional: true,
+          label: { type: "plain_text", text: "Files" },
+          element: {
+            // Slack file input element for modals
+            type: "file_input",
+            action_id: "hubnote_files_input",
+          },
+        },
+      ],
+    },
+  });
+});
+
+// Attach files modal submit
+app.view("hubnote_attach_files_submit", async ({ ack, body, view, client }) => {
+  await ack();
+  const meta = parsePrivateMetadata(view.private_metadata);
+  const sessionId = meta.sessionId;
+  const sess = hubnoteSessions.get(sessionId);
+  if (!sess) return;
+
+  const files =
+    view.state.values?.hubnote_files_block?.hubnote_files_input?.files || [];
+
+  await client.chat.postEphemeral({
+    channel: sess.channelId,
+    user: sess.userId,
+    text:
+      files.length > 0
+        ? `✅ Received ${files.length} file(s) in Slack. (HubSpot attach wiring is next.)`
+        : "✅ No files uploaded.",
+  });
+
+  hubnoteSessions.delete(sessionId);
 });
 
 // ==============================
-// Options loader: Slack file search (requires files:read scope)
-// ==============================
-app.options("hubnote_files_select", async ({ ack, body, options, client, logger }) => {
-  try {
-    const sessionId = parsePrivateMetadata(body?.view?.private_metadata)?.sessionId || "";
-    const session = hubnoteGetSession(sessionId);
-
-    if (!session) {
-      return await ack({
-        options: [option("Session expired — run /hubnote again", "SESSION_EXPIRED")],
-      });
-    }
-
-    const query = (options?.value || "").trim().toLowerCase();
-
-    const filesRes = await client.files.list({
-      user: session.originUserId,
-      count: 50,
-    });
-
-    const files = filesRes?.files || [];
-
-    const filtered = files
-      .filter((f) => {
-        const name = (f?.name || "").toLowerCase();
-        const title = (f?.title || "").toLowerCase();
-        if (!query) return true;
-        return name.includes(query) || title.includes(query);
-      })
-      .slice(0, 50)
-      .map((f) => {
-        const label = (f.title || f.name || `File ${f.id}`).slice(0, 75);
-        return option(label, f.id);
-      });
-
-    if (!filtered.length) {
-      return await ack({
-        options: [option("No matching files found", "NO_FILES_FOUND")],
-      });
-    }
-
-    await ack({ options: filtered });
-  } catch (e) {
-    logger.error(e);
-    await ack({
-      options: [option("ERROR loading files (check scopes/logs)", "ERROR_LOADING_FILES")],
-    });
-  }
-});
-
-// ==============================
-// Attach modal submit
-// ==============================
-//
-// NOTE: This only returns the Slack file IDs. Uploading bytes to HubSpot
-// is typically done in Zapier using Slack File download + HubSpot file upload + associate.
-// If your Zap currently expects to handle the file part later, keep this as-is.
-//
-app.view("hubnote_attach_modal_submit", async ({ ack, body, view, client, logger }) => {
-  try {
-    const meta = parsePrivateMetadata(view.private_metadata);
-    const sessionId = meta.sessionId || "";
-    const session = hubnoteGetSession(sessionId);
-
-    if (!session) {
-      await ack();
-      return;
-    }
-
-    const selected =
-      view.state.values.files_select_block.hubnote_files_select.selected_options || [];
-
-    const slackFileIds = selected.map((o) => o.value).filter(Boolean);
-
-    if (!slackFileIds.length) {
-      await ack({
-        response_action: "errors",
-        errors: { files_select_block: "Select at least one file." },
-      });
-      return;
-    }
-
-    await ack();
-
-    const attachNote =
-      view.state.values.attach_note_block?.attach_note_input?.value?.trim() || "";
-
-    // For now we just confirm success to the user.
-    // If you want Zap handling: add a Zapier webhook call here (optional).
-    await client.chat.postMessage({
-      channel: session.originUserId,
-      text:
-        `✅ Got it. Selected ${slackFileIds.length} file(s).\n` +
-        `• Slack File IDs: ${slackFileIds.join(", ")}\n` +
-        (attachNote ? `• Note: ${attachNote}` : ""),
-    });
-
-    // Keep session alive in case user adds more; or delete it:
-    // hubnoteDeleteSession(sessionId);
-  } catch (e) {
-    logger.error(e);
-    try {
-      await ack();
-    } catch (_) {}
-  }
-});
-
-// ==============================
-// START SERVER
+// Start
 // ==============================
 (async () => {
-  await app.start(process.env.PORT || 3000);
-  console.log("⚡️ SyllaBot is running (cstask + hubnote v2)");
+  try {
+    await app.start(PORT);
+    console.log("⚡️ SyllaBot is running (cstask + hubnote v2)");
+  } catch (e) {
+    console.error("Failed to start", e);
+    process.exit(1);
+  }
 })();
