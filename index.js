@@ -76,6 +76,22 @@ const receiver = new ExpressReceiver({
   },
 });
 
+// ===== DEBUG: Request logging =====
+receiver.app.use((req, res, next) => {
+  console.log("[REQ]", req.method, req.originalUrl, "CT:", req.headers["content-type"]);
+  res.on("finish", () => {
+    console.log("[RES]", req.method, req.originalUrl, "->", res.statusCode);
+  });
+  next();
+});
+
+// Helpful: log 404s
+receiver.app.use((req, res, next) => {
+  // Only runs if no route handled it
+  res.status(404).send("Not Found");
+  console.log("[404]", req.method, req.originalUrl);
+});
+
 // Basic request logging (keep while debugging)
 receiver.app.use((req, res, next) => {
   console.log(
@@ -99,6 +115,26 @@ const app = new App({
   receiver,
   logLevel: LogLevel.DEBUG,
 });
+
+// ===== DEBUG: Bolt event tracing =====
+app.use(async ({ body, next }) => {
+  try {
+    const type = body?.type;
+    const actionId = body?.actions?.[0]?.action_id;
+    const callbackId = body?.view?.callback_id;
+    const command = body?.command;
+    console.log("[BOLT]", { type, command, callbackId, actionId });
+  } catch (_) {}
+  await next();
+});
+
+app.error(async (error) => {
+  console.error("[BOLT_ERROR]", error);
+});
+
+// Catch anything that would otherwise crash silently
+process.on("unhandledRejection", (err) => console.error("[UNHANDLED_REJECTION]", err));
+process.on("uncaughtException", (err) => console.error("[UNCAUGHT_EXCEPTION]", err));
 
 // ==============================
 // HELPERS
