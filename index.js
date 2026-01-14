@@ -74,11 +74,184 @@ receiver.app.use((req, res, next) => {
 
 // Health check
 receiver.app.get("/", (req, res) => res.status(200).send("OK"));
-// ✅ NEW: Middleware endpoint (stub test)
-// Paste here first to confirm Render is deploying the route
-receiver.app.post("/api/hubnote/create", express.json(), (req, res) => {
-  console.log("[HIT] /api/hubnote/create", req.body);
-  return res.status(200).json({ ok: true, message: "route is live" });
+
+// ==============================
+// ✅ NEW: Middleware endpoint (REAL)
+// POST /api/hubnote/create
+// Creates a HubSpot note and associates it to a Ticket or Deal
+// ==============================
+
+const HUBSPOT_PRIVATE_APP_TOKEN = process.env.HUBSPOT_PRIVATE_APP_TOKEN || "";
+
+// Optional: protect this endpoint (recommended). If set, Zapier must send header x-zapier-secret
+const ZAPIER_HUBNOTE_SECRET = process.env.ZAPIER_HUBNOTE_SECRET || "";
+
+function hsPlural(type) {
+  return type === "deal" ? "deals" : "tickets";
+}
+
+function buildHubspotNoteBody(noteTitle, noteBody) {
+  const title = (noteTitle || "").trim();
+  const body = (noteBody || "").trim();
+
+  // HubSpot Notes UI doesn't reliably display a separate title,
+  // so we embed the title at the top for consistent UX.
+  if (title && body) return `**${title}**\n\n${body}`;
+  if (title && !body) return `**${title}**`;
+  return body;
+}
+
+async function hubspotRequest(method, path, body) {
+  if (!HUBSPOT_PRIVATE_APP_TOKEN) throw new Error("Missing HUBSPOT_PRIVATE_APP_TOKEN");
+
+  const url = `https://api.hubapi.com${path}`;
+  const headers = {
+    Authorization: `Bearer ${HUBSPOT_PRIVATE_APP_TOKEN}`,
+    "Content-Type": "application/json",
+    Accept: "application/json",
+  };
+
+  const config = {
+    method,
+    url,
+    headers,
+    timeout: 20000,
+  };
+
+  if (body !== undefined) config.data = body;
+
+  const res = await axios(config);
+  return res.data;
+}
+
+// Cache association type ids (HubSpot returns them via labels endpoint)
+const HS_ASSOC_CACHE_MS = 60 * 60 * 1000; // 1 hour
+const hsAssocCache = {
+  deal: { at: 0, associationTypeId: null },
+  ticket: { at: 0, associationTypeId: null },
+};
+
+async function hsGetAssociationTypeIdForNote(toType /* "deal"|"ticket" */) {
+  const cached = hsAssocCache[toType];
+  const now = Date.now();
+  if (cached?.associationTypeId && now - cached.at < HS_ASSOC_CACHE_MS) {
+    return cached.associationTypeId;
+  }
+
+  const toPlural = hsPlural(toType);
+
+  // HubSpot: GET /crm/v4/objects/notes/{toPlural}/labels
+  const data = await hubspotRequest("GET", `/crm/v4/objects/notes/${toPlural}/labels`);
+  const results = data?.results || [];
+
+  // Pick first available label/typeId
+  const pick = results[0];
+  const associationTypeId = pick?.typeId || pick?.associationTypeId || null;
+
+  if (!associationTypeId) {
+    throw new Error(
+      `Could not determine association typeId for notes -> ${toPlural}. Response: ${JSON.stringify(results)}`
+    );
+  }
+
+  hsAssocCache[toType] = { at: now, associationTypeId };
+  return associationTypeId;
+}
+
+receiver.app.post("/api/hubnote/create", express.json(), async (req, res) => {
+  try {
+    console.log("[HIT] /api/hubnote/create", req.body);
+
+    // Optional auth gate
+    if (ZAPIER_HUBNOTE_SECRET) {
+      const incoming = req.headers["x-zapier-secret"];
+      if (!incoming || incoming !== ZAPIER_HUBNOTE_SECRET) {
+        return res.status(401).json({ ok: false, error: "unauthorized" });
+      }
+    }
+
+    const {
+      correlation_id,
+      hubspot_object_type, // "ticket" | "deal"
+      hubspot_object_id,   // record id
+      note_title,
+      note_body,
+      submitted_by_slack_user_id,
+      submitted_at,
+      origin_channel_id,
+      origin_user_id,
+    } = req.body || {};
+
+    // Required fields
+    const missing = [];
+    if (!hubspot_object_type) missing.push("hubspot_object_type");
+    if (!hubspot_object_id) missing.push("hubspot_object_id");
+    if (!origin_channel_id) missing.push("origin_channel_id");
+    if (!origin_user_id) missing.push("origin_user_id");
+    if (!note_title) missing.push("note_title");
+    if (!note_body) missing.push("note_body");
+
+    if (missing.length) {
+      return res.status(400).json({
+        ok: false,
+        error: `missing ${missing.join(", ")}`,
+      });
+    }
+
+    const recordType = String(hubspot_object_type).toLowerCase() === "deal" ? "deal" : "ticket";
+    const recordId = String(hubspot_object_id);
+
+    const hsBody = buildHubspotNoteBody(note_title, note_body);
+
+    // 1) Create note
+    const created = await hubspotRequest("POST", "/crm/v3/objects/notes", {
+      properties: {
+        hs_note_body: hsBody,
+        hs_timestamp: String(Date.now()),
+      },
+    });
+
+    const noteId = created?.id ? String(created.id) : "";
+    if (!noteId) {
+      throw new Error(`HubSpot note create returned no id. Response: ${JSON.stringify(created)}`);
+    }
+
+    // 2) Associate note -> ticket/deal
+    const toPlural = hsPlural(recordType);
+    const associationTypeId = await hsGetAssociationTypeIdForNote(recordType);
+
+    // PUT /crm/v4/objects/notes/{noteId}/associations/{toPlural}/{recordId}/{associationTypeId}
+    await hubspotRequest(
+      "PUT",
+      `/crm/v4/objects/notes/${noteId}/associations/${toPlural}/${recordId}/${associationTypeId}`
+    );
+
+    // Return data for Zap Step 3 callback
+    return res.status(200).json({
+      ok: true,
+      status: "success",
+      correlation_id: correlation_id || "",
+      hubspot_note_id: noteId,
+      hubspot_object_type: recordType,
+      hubspot_object_id: recordId,
+      origin_channel_id,
+      origin_user_id,
+      submitted_by_slack_user_id: submitted_by_slack_user_id || "",
+      submitted_at: submitted_at || "",
+    });
+  } catch (e) {
+    // Axios errors often hide the real message in e.response.data
+    const hubspotErr = e?.response?.data;
+    console.error("[api/hubnote/create] error:", e?.message || e);
+    if (hubspotErr) console.error("[api/hubnote/create] hubspot response:", hubspotErr);
+
+    return res.status(500).json({
+      ok: false,
+      status: "error",
+      error: e?.message || "server_error",
+      hubspot: hubspotErr || undefined,
+    });
+  }
 });
 // ==============================
 // BOLT APP
