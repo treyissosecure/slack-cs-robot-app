@@ -621,117 +621,90 @@ async function hsGetPipelines(recordType) {
 }
 
 async function hsSearchRecords({ recordType, pipelineId, stageId, query }) {
-  const objectType = hsApiObjectType(recordType);
+  // HubSpot object types are plural in the v3 objects API
+  const objectTypePlural = recordType === "deal" ? "deals" : "tickets";
 
+  // Filters use different property names for deals vs tickets
+  const pipelineProp = recordType === "deal" ? HS_DEAL_PIPELINE_PROP : HS_TICKET_PIPELINE_PROP;
   const stageProp = recordType === "deal" ? HS_DEAL_STAGE_PROP : HS_TICKET_STAGE_PROP;
-  const pipelineProp = recordType === "deal" ? HS_PIPELINE_PROP_DEAL : HS_PIPELINE_PROP_TICKET;
 
-  const properties =
-    recordType === "deal"
-      ? ["dealname", pipelineProp, stageProp]
-      : ["subject", pipelineProp, stageProp];
-
-  const q = (query || "").trim();
-
-  // Primary: server-side filtered search (fast/accurate when HS accepts filters)
-  const primaryBody = {
-    filterGroups: [
-      {
-        filters: [
-          { propertyName: pipelineProp, operator: "EQ", value: String(pipelineId) },
-          { propertyName: stageProp, operator: "EQ", value: String(stageId) },
-        ],
-      },
-    ],
-    properties,
-    limit: 100,
+  const trimmedQuery = (query ?? "").trim();
+  const baseRequest = {
+    filterGroups: [],
+    sorts: [{ propertyName: "createdate", direction: "DESCENDING" }],
+    properties:
+      recordType === "deal"
+        ? ["dealname", pipelineProp, stageProp, "amount"]
+        : ["subject", pipelineProp, stageProp, "hs_ticket_priority", "createdate"],
+    limit: 20,
   };
-  if (q) primaryBody.query = q;
 
-  const primary = await hubspotRequest(
-    "POST",
-    `/crm/v3/objects/${objectType}/search`,
-    primaryBody
-  );
-
-  let results = primary?.results || [];
-
-  // Fallback: HubSpot can be picky about filtering on pipeline/stage for some portals.
-  // If primary returns nothing, do an unfiltered search (sorted by last modified),
-  // then filter client-side by the same pipeline + stage values.
-  
-// If HubSpot search returns 0 results (can happen with some pipeline/stage combos),
-// page through recent records and filter client-side until we find matches.
-if (!results.length && !q && pipelineId && stageId && pipelineProp && stageProp) {
-  try {
-    const p = String(pipelineId);
-    const st = String(stageId);
-
-    const maxPages = 5; // 5 * 100 = 500 recent records
-    let after = undefined;
-    let matches = [];
-
-    for (let i = 0; i < maxPages && matches.length < 50; i++) {
-      const body = {
-        properties,
-        limit: 100,
-        sorts: ["-hs_lastmodifieddate"],
-        ...(after ? { after } : {}),
-      };
-
-      const resp = await hubspotRequest("POST", `/crm/v3/objects/${objectType}/search`, body);
-      const all = resp?.results || [];
-
-      for (const r of all) {
-        const props = r.properties || {};
-        if (String(props[pipelineProp] ?? "") === p && String(props[stageProp] ?? "") === st) {
-          matches.push(r);
-        }
-      }
-
-      after = resp?.paging?.next?.after;
-      if (!after) break;
+  // Helper to run a search with optional stage/pipeline filters
+  const runSearch = async ({ includeFilters }) => {
+    const filterGroups = [];
+    if (includeFilters) {
+      const filters = [];
+      if (pipelineId) filters.push({ propertyName: pipelineProp, operator: "EQ", value: String(pipelineId) });
+      if (stageId) filters.push({ propertyName: stageProp, operator: "EQ", value: String(stageId) });
+      if (filters.length) filterGroups.push({ filters });
+    }
+    if (trimmedQuery) {
+      // Search by deal name or ticket subject
+      const qProp = recordType === "deal" ? "dealname" : "subject";
+      filterGroups.push({ filters: [{ propertyName: qProp, operator: "CONTAINS_TOKEN", value: trimmedQuery }] });
     }
 
-    if (matches.length) results = matches;
-  } catch (_) {}
-}
-return results.map((r) => {
-    const id = String(r.id);
-    const props = r.properties || {};
-    const label =
-      recordType === "deal"
-        ? props.dealname || `Deal ${id}`
-        : props.subject || `Ticket ${id}`;
-    return { id, label };
-  });
-}
+    const payload = { ...baseRequest, filterGroups };
+    logger.debug(`[HS] search ${objectTypePlural}: includeFilters=${includeFilters} pipelineId=${pipelineId} stageId=${stageId} q="${trimmedQuery}"`);
+    return await hubspotRequest(`/crm/v3/objects/${objectTypePlural}/search`, { method: "POST", body: payload });
+  };
 
-async function hsGetNoteAssociationTypeId(toObjectTypePlural) {
-  const now = Date.now();
-  const cached = hsCache.assocTypeId.get(toObjectTypePlural);
-  if (cached?.id && now - cached.at < HS_CACHE_MS) return cached.id;
+  try {
+    // 1) Try strict (pipeline+stage) filter
+    const strictRes = await runSearch({ includeFilters: true });
+    const strictResults = Array.isArray(strictRes?.results) ? strictRes.results : [];
 
-  const data = await hubspotRequest(
-    "GET",
-    `/crm/v4/associations/notes/${toObjectTypePlural}/labels`
-  );
+    if (strictResults.length > 0) {
+      logger.debug(`[HS] search ${objectTypePlural} strict results: ${strictResults.length} (total=${strictRes.total ?? "?"})`);
+      return strictResults.map((r) => ({
+        id: r.id,
+        label:
+          recordType === "deal"
+            ? r.properties?.dealname || `Deal ${r.id}`
+            : r.properties?.subject || `Ticket ${r.id}`,
+      }));
+    }
 
-  const results = data?.results || [];
-  const preferred = results.find((r) =>
-    String(r.label || "").toLowerCase().includes("note")
-  );
-  const chosen = preferred || results[0];
+    // 2) Fallback: if strict returns 0, try *without* pipeline/stage filters
+    // This helps when the stored values differ from what the pipelines endpoint returns, or if permissions prevent filtering.
+    const looseRes = await runSearch({ includeFilters: false });
+    const looseResults = Array.isArray(looseRes?.results) ? looseRes.results : [];
 
-  const id = chosen?.typeId;
-  if (!id) {
-    throw new Error(
-      `Could not determine association typeId for notes -> ${toObjectTypePlural}`
+    logger.debug(
+      `[HS] search ${objectTypePlural} fallback results: ${looseResults.length} (total=${looseRes.total ?? "?"}); strict was 0`
     );
-  }
 
-  hsCache.assocTypeId.set(toObjectTypePlural, { at: now, id: Number(id) });
-  return Number(id);
+    return looseResults.map((r) => ({
+      id: r.id,
+      label:
+        recordType === "deal"
+          ? r.properties?.dealname || `Deal ${r.id}`
+          : r.properties?.subject || `Ticket ${r.id}`,
+    }));
+  } catch (err) {
+    const status = err?.status || err?.response?.status;
+    const msg = err?.message || String(err);
+    const details =
+      err?.body ||
+      err?.response?.data ||
+      err?.response?.body ||
+      undefined;
+
+    logger.error(`[HS] search ${objectTypePlural} failed: status=${status ?? "?"} msg=${msg}`);
+    if (details) logger.error(`[HS] search error details: ${safeJson(details)}`);
+
+    return [];
+  }
 }
 
 async function hsCreateNoteAndAssociate({ hubspot_object_type, hubspot_object_id, note_title, note_body }) {
@@ -1159,7 +1132,8 @@ app.options("hubnote_v2_record_select", async ({ body, options, ack, logger }) =
     ]);
 
     const mapped = (records || []).slice(0, 100).map((r) => option(r.label, r.id));
-    await ack({ options: mapped.length ? mapped : [option("No results", "__none__")] });
+    logger.debug(`[Slack] record_select options: recordType=${recordType} pipelineId=${pipelineId} stageId=${stageId} q="${query}" -> ${mapped.length}`);
+    await ack({ options: mapped });
   } catch (e) {
     if (String(e.message || "").includes("timeout")) {
       return await ack({ options: [option("Search timed out — try again", "__timeout__")] });
