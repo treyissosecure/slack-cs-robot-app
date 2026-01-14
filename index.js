@@ -577,8 +577,6 @@ const hsCache = {
   assocTypeId: new Map(), // key: "tickets"|"deals" -> { at, id }
 };
 
-const HS_TICKET_STAGE_PROP = "hs_pipeline_stage";
-const HS_DEAL_STAGE_PROP = "dealstage";
 const HS_PIPELINE_PROP_DEAL = "pipeline";
 const HS_PIPELINE_PROP_TICKET = "hs_pipeline";
 
