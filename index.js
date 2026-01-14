@@ -1366,16 +1366,27 @@ async function hsGetAssociationTypeIdForNote(toType /* "deal"|"ticket" */) {
   return associationTypeId;
 }
 
+// ✅ Middleware endpoint: Zapier -> SyllaBot (create HubSpot note)
 receiver.app.post("/api/hubnote/create", express.json(), async (req, res) => {
   try {
-    // Optional auth: if you set ZAPIER_HUBNOTE_SECRET in Render,
-    // Zapier should send header x-zapier-secret with that value.
-    if (ZAPIER_HUBNOTE_SECRET) {
+    // Optional auth header check
+    if (HUBNOTE_ZAPIER_SECRET) {
       const incoming = req.headers["x-zapier-secret"];
-      if (!incoming || incoming !== ZAPIER_HUBNOTE_SECRET) {
+      if (!incoming || incoming !== HUBNOTE_ZAPIER_SECRET) {
+        console.log("[AUTH] /api/hubnote/create unauthorized");
         return res.status(401).json({ ok: false, error: "unauthorized" });
       }
     }
+
+    console.log("[HIT] /api/hubnote/create", req.body);
+
+    // TODO: your hubspot create logic here
+    return res.status(200).json({ ok: true, message: "route is live" });
+  } catch (e) {
+    console.error("[/api/hubnote/create] error:", e?.message || e);
+    return res.status(500).json({ ok: false, error: "server_error" });
+  }
+});
 
     const {
       correlation_id,
