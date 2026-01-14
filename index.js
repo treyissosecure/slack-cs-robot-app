@@ -137,9 +137,31 @@ function findSelectedOptionValue(viewStateValues, actionId) {
   return "";
 }
 
-function option(text, value) {
-  return { text: { type: "plain_text", text }, value: String(value) };
+function slackSanitizeText(input, maxLen = 75) {
+  let s = (input ?? "").toString();
+  // Slack option text must be plain_text (no newlines) and max 75 chars.
+  s = s.replace(/[\r\n\t]+/g, " ").replace(/\s{2,}/g, " ").trim();
+  if (!s) s = "—";
+  if (s.length > maxLen) s = s.slice(0, Math.max(0, maxLen - 1)) + "…";
+  return s;
 }
+
+function slackOptionValue(input, maxLen = 75) {
+  let v = (input ?? "").toString();
+  // Slack option value max 75 chars; avoid whitespace/newlines.
+  v = v.replace(/[\r\n\t]+/g, " ").replace(/\s+/g, "_").trim();
+  if (!v) v = "0";
+  if (v.length > maxLen) v = v.slice(0, maxLen);
+  return v;
+}
+
+function option(text, value) {
+  return {
+    text: { type: "plain_text", text: slackSanitizeText(text, 75), emoji: true },
+    value: slackOptionValue(value, 75),
+  };
+}
+
 
 function nowIso() {
   return new Date().toISOString();
@@ -621,7 +643,7 @@ function hsApiObjectType(recordType) {
   return recordType === "deal" ? "deals" : "tickets";
 }
 
-async function hubspotRequest(method, path, data) {
+async function hubspotRequest(method, path, data, opts = {}) {
   if (!HUBSPOT_PRIVATE_APP_TOKEN) throw new Error("Missing HUBSPOT_PRIVATE_APP_TOKEN");
   const url = `https://api.hubapi.com${path}`;
   const res = await axios({
@@ -632,7 +654,7 @@ async function hubspotRequest(method, path, data) {
       Authorization: `Bearer ${HUBSPOT_PRIVATE_APP_TOKEN}`,
       "Content-Type": "application/json",
     },
-    timeout: 8000,
+    timeout: typeof opts.timeoutMs === "number" ? opts.timeoutMs : 8000,
   });
   return res.data;
 }
@@ -1143,43 +1165,100 @@ app.action("hubnote_v2_stage_select", async ({ ack, body, client, logger }) => {
         noteBodyInitial,
       }),
     });
+
+// Prefetch records for the current (recordType, pipeline, stage) so the record dropdown
+// can respond instantly without timing out (Slack shows timeouts as "No results").
+setImmediate(() => {
+  hsSearchRecords({
+    recordType: meta.recordType || "ticket",
+    pipelineId: meta.pipelineId || "",
+    stageId: meta.stageId || "",
+    query: "",
+    logger,
+    timeoutMs: 8000,
+    cacheTtlMs: 30_000,
+  }).catch(() => {});
+});
   } catch (e) {
     logger.error(e);
   }
 });
 
 // Record dropdown options (dependent on recordType + pipelineId + stageId)
+
+
 app.options("hubnote_v2_record_select", async ({ body, options, ack, logger }) => {
+  // IMPORTANT: external_select options requests must be acknowledged within 3 seconds.
+  // If HubSpot is slow, we serve cached results (prefetched on stage selection) or a
+  // "Loading…" placeholder rather than timing out (which Slack shows as "No results").
   try {
-    const meta = parsePrivateMetadata(body?.view?.private_metadata);
+    const meta = safeJsonParse(body?.view?.private_metadata) || {};
     const recordType = meta.recordType || "ticket";
     const pipelineId = meta.pipelineId || "";
     const stageId = meta.stageId || "";
 
-    if (!pipelineId || pipelineId === "__loading__") {
-      return await ack({ options: [option("Select a pipeline first", "__select_pipeline__")] });
+    const qRaw = options?.value;
+    const q = typeof qRaw === "string" ? qRaw.trim() : "";
+
+    if (!pipelineId || !stageId) {
+      await ack({ options: [option("Select a pipeline + stage first", "missing_pipeline_stage")] });
+      return;
     }
-    if (!stageId || stageId === "__loading__") {
-      return await ack({ options: [option("Select a stage first", "__select_stage__")] });
+
+    // Fast path: serve from cache if present
+    const cacheKey = `records:${recordType}:${pipelineId}:${stageId}:${q || ""}`;
+    const cached = hsCacheGet(cacheKey);
+    if (Array.isArray(cached) && cached.length > 0) {
+      logger?.debug?.(
+        `[Slack] record_select options (cached): recordType=${recordType} pipelineId=${pipelineId} stageId=${stageId} q="${q}" -> ${cached.length}`
+      );
+      await ack({ options: cached.map((r) => option(r.label, r.value)) });
+      return;
     }
 
-    const query = options?.value || "";
+    // If user is typing, try a quick search; otherwise rely on prefetched cache.
+    if (q) {
+      const records = await hsSearchRecords({
+        recordType,
+        pipelineId,
+        stageId,
+        query: q,
+        logger,
+        timeoutMs: 2200,
+        cacheTtlMs: 30_000,
+      });
 
-    // Ensure ack under 3 seconds.
-    const records = await Promise.race([
-      hsSearchRecords({ recordType, pipelineId, stageId, query }),
-      new Promise((_, reject) => setTimeout(() => reject(new Error("timeout")), 2500)),
-    ]);
+      logger?.debug?.(
+        `[Slack] record_select options: recordType=${recordType} pipelineId=${pipelineId} stageId=${stageId} q="${q}" -> ${records.length}`
+      );
 
-    const mapped = (records || []).slice(0, 100).map((r) => option(r.label, r.id));
-    logger.debug(`[Slack] record_select options: recordType=${recordType} pipelineId=${pipelineId} stageId=${stageId} q="${query}" -> ${mapped.length}`);
-    await ack({ options: mapped });
+      await ack({
+        options:
+          records.length > 0
+            ? records.map((r) => option(r.label, r.value))
+            : [option("No matches. Try a different search.", "no_matches")],
+      });
+      return;
+    }
+
+    // Empty query: immediately return placeholder and kick off background prefetch.
+    // Slack will call this handler again when the user re-opens the dropdown (or types).
+    setImmediate(() => {
+      hsSearchRecords({
+        recordType,
+        pipelineId,
+        stageId,
+        query: "",
+        logger,
+        timeoutMs: 8000,
+        cacheTtlMs: 30_000,
+      }).catch(() => {});
+    });
+
+    await ack({ options: [option("Loading records… (re-open or start typing)", "loading_records")] });
   } catch (e) {
-    if (String(e.message || "").includes("timeout")) {
-      return await ack({ options: [option("Search timed out — try again", "__timeout__")] });
-    }
-    logger.error(e);
-    await ack({ options: [option("Error searching records", "__error__")] });
+    logger?.error?.(e);
+    await ack({ options: [option("Error loading records. Try again.", "error_records")] });
   }
 });
 
