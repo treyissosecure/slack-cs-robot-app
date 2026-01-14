@@ -644,7 +644,7 @@ async function hsSearchRecords({ recordType, pipelineId, stageId, query }) {
       },
     ],
     properties,
-    limit: 50,
+    limit: 100,
   };
   if (q) primaryBody.query = q;
 
@@ -659,30 +659,44 @@ async function hsSearchRecords({ recordType, pipelineId, stageId, query }) {
   // Fallback: HubSpot can be picky about filtering on pipeline/stage for some portals.
   // If primary returns nothing, do an unfiltered search (sorted by last modified),
   // then filter client-side by the same pipeline + stage values.
-  if (!results.length && !q) {
-    const fallbackBody = {
-      properties,
-      limit: 100,
-      sorts: ["-hs_lastmodifieddate"],
-    };
-
-    const fallback = await hubspotRequest(
-      "POST",
-      `/crm/v3/objects/${objectType}/search`,
-      fallbackBody
-    );
-
-    const all = fallback?.results || [];
+  
+// If HubSpot search returns 0 results (can happen with some pipeline/stage combos),
+// page through recent records and filter client-side until we find matches.
+if (!results.length && !q && pipelineId && stageId && pipelineProp && stageProp) {
+  try {
     const p = String(pipelineId);
-    const s = String(stageId);
+    const st = String(stageId);
 
-    results = all.filter((r) => {
-      const props = r.properties || {};
-      return String(props[pipelineProp] ?? "") === p && String(props[stageProp] ?? "") === s;
-    });
-  }
+    const maxPages = 5; // 5 * 100 = 500 recent records
+    let after = undefined;
+    let matches = [];
 
-  return results.map((r) => {
+    for (let i = 0; i < maxPages && matches.length < 50; i++) {
+      const body = {
+        properties,
+        limit: 100,
+        sorts: ["-hs_lastmodifieddate"],
+        ...(after ? { after } : {}),
+      };
+
+      const resp = await hubspotRequest("POST", `/crm/v3/objects/${objectType}/search`, body);
+      const all = resp?.results || [];
+
+      for (const r of all) {
+        const props = r.properties || {};
+        if (String(props[pipelineProp] ?? "") === p && String(props[stageProp] ?? "") === st) {
+          matches.push(r);
+        }
+      }
+
+      after = resp?.paging?.next?.after;
+      if (!after) break;
+    }
+
+    if (matches.length) results = matches;
+  } catch (_) {}
+}
+return results.map((r) => {
     const id = String(r.id);
     const props = r.properties || {};
     const label =
