@@ -74,7 +74,12 @@ receiver.app.use((req, res, next) => {
 
 // Health check
 receiver.app.get("/", (req, res) => res.status(200).send("OK"));
-
+// ✅ NEW: Middleware endpoint (stub test)
+// Paste here first to confirm Render is deploying the route
+receiver.app.post("/api/hubnote/create", express.json(), (req, res) => {
+  console.log("[HIT] /api/hubnote/create", req.body);
+  return res.status(200).json({ ok: true, message: "route is live" });
+});
 // ==============================
 // BOLT APP
 // ==============================
