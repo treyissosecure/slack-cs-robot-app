@@ -587,6 +587,24 @@ const hsCache = {
   assocTypeId: new Map(), // key: "tickets"|"deals" -> { at, id }
 };
 
+// Lightweight in-memory cache for HubSpot *search* responses.
+// Render may run multiple instances; this is best-effort per instance.
+const _hsSearchCache = new Map(); // key -> { value, expiresAt }
+
+function hsCacheGet(key) {
+  const entry = _hsSearchCache.get(key);
+  if (!entry) return null;
+  if (Date.now() > entry.expiresAt) {
+    _hsSearchCache.delete(key);
+    return null;
+  }
+  return entry.value;
+}
+
+function hsCacheSet(key, value, ttlMs = 30 * 1000) {
+  _hsSearchCache.set(key, { value, expiresAt: Date.now() + ttlMs });
+}
+
 const HS_TICKET_STAGE_PROP = "hs_pipeline_stage";
 const HS_DEAL_STAGE_PROP = "dealstage";
 const HS_DEAL_PIPELINE_PROP = "pipeline";
