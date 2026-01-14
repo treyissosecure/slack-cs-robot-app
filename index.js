@@ -116,6 +116,103 @@ const app = new App({
   logLevel: LogLevel.DEBUG,
 });
 
+// --------------------------------
+// Hubnote v2 modal builder (REQUIRED)
+// Paste ABOVE app.command("/hubnote"...)
+// --------------------------------
+function buildHubnoteModalV2({ correlationId, originChannelId, originUserId }) {
+  return {
+    type: "modal",
+    callback_id: "hubnote_modal_submit_v2",
+    title: { type: "plain_text", text: "HubSpot Note" },
+    submit: { type: "plain_text", text: "Create" },
+    close: { type: "plain_text", text: "Cancel" },
+    private_metadata: JSON.stringify({
+      correlationId,
+      originChannelId,
+      originUserId,
+      version: "v2",
+      recordType: "ticket", // default
+      pipelineId: "",
+      stageId: "",
+      recordId: "",
+    }),
+    blocks: [
+      {
+        type: "input",
+        block_id: "record_type_block_v2",
+        dispatch_action: true,
+        label: { type: "plain_text", text: "Record Type" },
+        element: {
+          type: "static_select",
+          action_id: "hubnote_v2_record_type_select",
+          placeholder: { type: "plain_text", text: "Ticket or Deal" },
+          options: [
+            { text: { type: "plain_text", text: "Ticket" }, value: "ticket" },
+            { text: { type: "plain_text", text: "Deal" }, value: "deal" },
+          ],
+        },
+      },
+      {
+        type: "input",
+        block_id: "pipeline_block_v2",
+        dispatch_action: true,
+        label: { type: "plain_text", text: "Pipeline" },
+        element: {
+          type: "external_select",
+          action_id: "hubnote_v2_pipeline_select",
+          placeholder: { type: "plain_text", text: "Select a pipeline" },
+          min_query_length: 0,
+        },
+      },
+      {
+        type: "input",
+        block_id: "stage_block_v2",
+        dispatch_action: true,
+        label: { type: "plain_text", text: "Pipeline Stage" },
+        element: {
+          type: "external_select",
+          action_id: "hubnote_v2_stage_select",
+          placeholder: { type: "plain_text", text: "Select a stage" },
+          min_query_length: 0,
+        },
+      },
+      {
+        type: "input",
+        block_id: "record_block_v2",
+        label: { type: "plain_text", text: "Record" },
+        element: {
+          type: "external_select",
+          action_id: "hubnote_v2_record_select",
+          placeholder: { type: "plain_text", text: "Search/select a record" },
+          min_query_length: 0,
+        },
+      },
+      {
+        type: "input",
+        block_id: "note_title_block_v2",
+        label: { type: "plain_text", text: "Note Title / Subject" },
+        element: {
+          type: "plain_text_input",
+          action_id: "hubnote_v2_note_title_input",
+          placeholder: { type: "plain_text", text: "e.g., Call recap" },
+        },
+      },
+      {
+        type: "input",
+        block_id: "note_body_block_v2",
+        label: { type: "plain_text", text: "Note Body" },
+        element: {
+          type: "plain_text_input",
+          action_id: "hubnote_v2_note_body_input",
+          multiline: true,
+          placeholder: { type: "plain_text", text: "Write your note..." },
+        },
+      },
+    ],
+  };
+}
+
 // ==============================
 // /hubnote — handler (ACK FIRST)
 // ==============================
