@@ -74,6 +74,30 @@ function safeJsonParse(str, fallback = null) {
 }
 
 
+function getSelectedValueFromViewState(view, actionId) {
+  try {
+    const values = view?.state?.values;
+    if (!values || typeof values !== "object") return "";
+    for (const blockId of Object.keys(values)) {
+      const block = values[blockId];
+      if (!block || typeof block !== "object") continue;
+      for (const aId of Object.keys(block)) {
+        if (aId !== actionId) continue;
+        const actionState = block[aId];
+        if (!actionState || typeof actionState !== "object") return "";
+        // selects
+        if (actionState.selected_option?.value !== undefined) return String(actionState.selected_option.value);
+        // plain text inputs
+        if (actionState.value !== undefined) return String(actionState.value);
+      }
+    }
+    return "";
+  } catch {
+    return "";
+  }
+}
+
+
 // ==============================
 // SLACK RECEIVER
 // ==============================
@@ -755,19 +779,22 @@ async function hsSearchRecords({
     // First attempt: pipeline + stage + optional query
     let results = await runSearch(filters);
 
-    // Fallback 1: if stage filter is too restrictive, retry without stage
-    if (results.length === 0 && stageId) {
-      const noStage = filters.filter((f) => f.propertyName !== stageProp);
-      results = await runSearch(noStage);
-    }
+    // Only relax filters when the user actually typed a query.
+    // If q is empty, we should NOT "fallback" to unrelated records — that feels like a bug in Slack.
+    if (results.length === 0 && q) {
+      // Fallback 1: if stage is too restrictive, retry without stage (keep pipeline + query)
+      if (stageId) {
+        const noStage = filters.filter((f) => f.propertyName !== stageProp);
+        results = await runSearch(noStage);
+      }
 
-    // Fallback 2: if still empty, retry with only query (or no filters)
-    if (results.length === 0) {
-      const queryOnly = filters.filter((f) => {
+      // Fallback 2: if still empty, retry with pipeline + query only (no stage)
+      if (results.length === 0 && pipelineId) {
         const nameProp = recordType === "deal" ? "dealname" : "subject";
-        return f.propertyName === nameProp;
-      });
-      results = await runSearch(queryOnly);
+        const pipelineProp = recordType === "deal" ? "pipeline" : "hs_pipeline";
+        const relaxed = filters.filter((f) => f.propertyName === nameProp || f.propertyName === pipelineProp);
+        results = await runSearch(relaxed);
+      }
     }
 
     hsCacheSet(cacheKey, results);
@@ -1202,10 +1229,17 @@ setImmediate(() => {
 app.options("hubnote_v2_record_select", async ({ body, options, ack, logger }) => {
   // IMPORTANT: external_select with min_query_length: 0 will call this with an empty query.
   const q = (options && typeof options.value === "string") ? options.value.trim() : "";
-  const meta = safeJsonParse(body?.view?.private_metadata, {}) || {};
-  const recordType = meta.recordType || "ticket";
-  const pipelineId = meta.pipelineId ?? "";
-  const stageId = meta.stageId ?? "";
+  const view = body?.view || {};
+  const meta = safeJsonParse(view.private_metadata, {}) || {};
+
+  // Prefer live state values (what the user actually selected) over private_metadata,
+  // because private_metadata can lag if a view.update was missed / out-of-order.
+  const recordType =
+    getSelectedValueFromViewState(view, "hubnote_v2_record_type_select") || meta.recordType || "ticket";
+  const pipelineId =
+    getSelectedValueFromViewState(view, "hubnote_v2_pipeline_select") || (meta.pipelineId ?? "");
+  const stageId =
+    getSelectedValueFromViewState(view, "hubnote_v2_stage_select") || (meta.stageId ?? "");
 
   const cacheKey = `recopt:${recordType}:${pipelineId}:${stageId}:${q || "__empty__"}`;
 
