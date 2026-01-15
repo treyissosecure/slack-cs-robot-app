@@ -852,6 +852,9 @@ async function hsCreateNoteAndAssociate({
 
   const createBody = {
     properties: {
+      // HubSpot "notes" require both a body and a timestamp.
+      // hs_timestamp is a datetime property; HubSpot accepts milliseconds since epoch.
+      hs_timestamp: String(Date.now()),
       hs_note_body: combinedBody,
     },
     associations: [
