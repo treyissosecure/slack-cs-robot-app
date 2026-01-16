@@ -291,6 +291,100 @@ function safeJsonStringify(obj, fallback = "{}") {
   }
 }
 
+// ==============================
+// HUBSPOT FILE UPLOAD + NOTE ATTACHMENTS
+// ==============================
+// Uploads a file into HubSpot Files (File Manager) and returns the created file info.
+// Uses the Files API v3 multipart upload.
+async function hsUploadFileToHubSpot({ buffer, filename, mimeType, folderPath = "/slack-uploads" }) {
+  if (!HUBSPOT_PRIVATE_APP_TOKEN) {
+    throw new Error("Missing HUBSPOT_PRIVATE_APP_TOKEN");
+  }
+
+  // Node 18+ provides global FormData/Blob via undici.
+  const form = new FormData();
+  const blob = new Blob([buffer], { type: mimeType || "application/octet-stream" });
+
+  form.append("file", blob, filename || "upload.bin");
+  form.append("folderPath", folderPath);
+
+  // HubSpot expects `options` as JSON. Keep it private by default.
+  form.append(
+    "options",
+    JSON.stringify({
+      access: "PRIVATE",
+      overwrite: false,
+      duplicateValidationStrategy: "NONE",
+      duplicateValidationScope: "ENTIRE_PORTAL",
+    })
+  );
+
+  const res = await fetch("https://api.hubapi.com/files/v3/files", {
+    method: "POST",
+    headers: {
+      Authorization: `Bearer ${HUBSPOT_PRIVATE_APP_TOKEN}`,
+      // DO NOT set Content-Type manually; fetch will set the multipart boundary.
+    },
+    body: form,
+  });
+
+  const text = await res.text();
+  const data = safeJsonParse(text, null);
+  if (!res.ok) {
+    const msg = data?.message || data?.error || text;
+    throw new Error(`HubSpot file upload failed (${res.status}): ${msg}`);
+  }
+
+  // Typical response includes `id` and `url`.
+  return {
+    id: String(data?.id ?? ""),
+    url: String(data?.url ?? data?.downloadUrl ?? ""),
+    name: String(data?.name ?? filename ?? ""),
+  };
+}
+
+async function hsGetNoteAttachments(noteId) {
+  const note = await hubspotRequest(
+    "GET",
+    `/crm/v3/objects/notes/${encodeURIComponent(noteId)}?properties=hs_attachment_ids,hs_note_body`
+  );
+  const props = note?.properties || {};
+  const raw = String(props.hs_attachment_ids || "").trim();
+  const ids = raw ? raw.split(";").map((s) => s.trim()).filter(Boolean) : [];
+  return { ids, body: String(props.hs_note_body || "") };
+}
+
+async function hsPatchNote(noteId, properties) {
+  return hubspotRequest("PATCH", `/crm/v3/objects/notes/${encodeURIComponent(noteId)}`, {
+    properties,
+  });
+}
+
+async function slackDownloadFile({ client, slackFileId }) {
+  const info = await client.files.info({ file: slackFileId });
+  if (!info?.ok) {
+    throw new Error(`Slack files.info failed for ${slackFileId}`);
+  }
+
+  const f = info.file || {};
+  const url = f.url_private_download || f.url_private;
+  if (!url) throw new Error(`Slack file ${slackFileId} missing url_private_download`);
+
+  const filename = f.name || `slack_${slackFileId}`;
+  const mimeType = f.mimetype || "application/octet-stream";
+
+  const resp = await axios.get(url, {
+    responseType: "arraybuffer",
+    headers: { Authorization: `Bearer ${process.env.SLACK_BOT_TOKEN}` },
+  });
+
+  return {
+    buffer: Buffer.from(resp.data),
+    filename,
+    mimeType,
+  };
+}
+
 function buildCleanViewPayload(view, privateMetadataString) {
   return {
     type: "modal",
@@ -1707,7 +1801,7 @@ app.action("hubnote_v2_attach_yes", async ({ ack, body, client, logger }) => {
     const payload = safeJsonParse(body?.actions?.[0]?.value, {}) || {};
     await client.views.open({
       trigger_id: body.trigger_id,
-      view: buildAttachLinksModalV2(payload),
+      view: buildAttachFilesModalV2(payload),
     });
   } catch (e) {
     logger.error(e);
@@ -1800,6 +1894,120 @@ app.view("hubnote_attach_links_submit_v2", async ({ ack, body, view, client, log
       response_action: "errors",
       errors: { attach_links_block_v2: "Something went wrong. Please try again." },
     });
+  }
+});
+
+// Attach Slack-uploaded files to the SAME HubSpot note (hs_attachment_ids)
+app.view("hubnote_attach_files_submit_v2", async ({ ack, body, view, client, logger }) => {
+  try {
+    const meta = safeJsonParse(view?.private_metadata, {}) || {};
+    const noteId = meta.noteId;
+    const noteTitle = meta.noteTitle || "HubSpot Note";
+    if (!noteId) {
+      await ack({
+        response_action: "errors",
+        errors: { files_block_v2: "Missing note context. Please run /hubnote again." },
+      });
+      return;
+    }
+
+    // Extract Slack file IDs from the file_input element
+    const state = view?.state?.values || {};
+    let slackFileIds = [];
+    for (const block of Object.values(state)) {
+      for (const action of Object.values(block || {})) {
+        if (action?.type === "file_input" && Array.isArray(action?.files) && action.files.length) {
+          slackFileIds = action.files;
+          break;
+        }
+      }
+      if (slackFileIds.length) break;
+    }
+
+    if (!slackFileIds.length) {
+      await ack({
+        response_action: "errors",
+        errors: { files_block_v2: "Please upload at least one file." },
+      });
+      return;
+    }
+
+    await ack();
+
+    // Fetch existing note props so we can append attachments + optionally append a link list.
+    const existing = await hubspotRequest(
+      "GET",
+      `/crm/v3/objects/notes/${encodeURIComponent(noteId)}?properties=hs_attachment_ids,hs_note_body`
+    );
+    const existingAttach = (existing?.properties?.hs_attachment_ids || "").trim();
+    const existingBody = existing?.properties?.hs_note_body || "";
+
+    const uploadedHubSpotFiles = [];
+    for (const slackFileId of slackFileIds) {
+      try {
+        const { buffer, filename, mimeType } = await slackDownloadFile({ client, slackFileId });
+        const uploaded = await hsUploadFileToHubSpot({
+          buffer,
+          filename,
+          mimeType,
+          folderPath: "/SyllaBot Uploads",
+        });
+        uploadedHubSpotFiles.push(uploaded);
+      } catch (e) {
+        logger.error(e);
+      }
+    }
+
+    if (!uploadedHubSpotFiles.length) {
+      const userId = body?.user?.id;
+      if (userId) {
+        await client.chat.postMessage({
+          channel: userId,
+          text: "❌ I couldn't upload any of the files to HubSpot. Please try again.",
+        });
+      }
+      return;
+    }
+
+    const newIds = uploadedHubSpotFiles.map((f) => String(f.id)).filter(Boolean);
+    const combinedIds = [
+      ...existingAttach
+        .split(";")
+        .map((s) => s.trim())
+        .filter(Boolean),
+      ...newIds,
+    ];
+    const uniqueIds = Array.from(new Set(combinedIds));
+
+    // Optional: also append a human-friendly list of file links into the note body.
+    const linkLines = uploadedHubSpotFiles
+      .map((f) => (f.url ? `• ${f.name || "File"}: ${f.url}` : null))
+      .filter(Boolean)
+      .join("\n");
+    const appendedBody = linkLines
+      ? `${existingBody || ""}\n\n📎 Attachments added via Slack:\n${linkLines}`.trim()
+      : existingBody;
+
+    await hsPatchNote(noteId, {
+      hs_attachment_ids: uniqueIds.join(";"),
+      ...(appendedBody ? { hs_note_body: appendedBody } : {}),
+    });
+
+    const userId = body?.user?.id;
+    if (userId) {
+      await client.chat.postMessage({
+        channel: userId,
+        text: `✅ Attached ${uploadedHubSpotFiles.length} file(s) to the original note: ${noteTitle}`,
+      });
+    }
+  } catch (e) {
+    logger.error(e);
+    try {
+      await ack({
+        response_action: "errors",
+        errors: { files_block_v2: "Something went wrong. Please try again." },
+      });
+    } catch {}
   }
 });
 
