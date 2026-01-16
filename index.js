@@ -291,6 +291,15 @@ function safeJsonStringify(obj, fallback = "{}") {
   }
 }
 
+function escapeHtml(s) {
+  return String(s ?? "")
+    .replace(/&/g, "&amp;")
+    .replace(/</g, "&lt;")
+    .replace(/>/g, "&gt;")
+    .replace(/\"/g, "&quot;")
+    .replace(/'/g, "&#39;");
+}
+
 // ==============================
 // HUBSPOT FILE UPLOAD + NOTE ATTACHMENTS
 // ==============================
@@ -973,7 +982,9 @@ async function hsCreateNoteAndAssociate({
   const toPlural = hubspot_object_type === "deal" ? "deals" : "tickets";
   const assocTypeId = await hsGetNoteAssociationTypeId(toPlural);
 
-  const combinedBody = `**${note_title || "Note"}**\n${note_body || ""}`;
+  const titleHtml = `<b>${escapeHtml(note_title || "Note")}</b>`;
+  const bodyHtml = escapeHtml(note_body || "").replace(/\r?\n/g, "<br/>");
+  const combinedBody = `${titleHtml}<br/>${bodyHtml}`;
 
   const createBody = {
     properties: {
@@ -1674,7 +1685,7 @@ app.view("hubnote_modal_submit_v2", async ({ ack, body, view, client, logger }) 
             type: "section",
             text: {
               type: "mrkdwn",
-              text: `✅ *HubSpot note created!*\n\n:paperclip: Do you want to add attachment *links* to this note?`,
+              text: `✅ *HubSpot note created!*\n\n:paperclip: Do you want to upload files to attach to this note?`,
             },
           },
           {
@@ -1693,15 +1704,6 @@ app.view("hubnote_modal_submit_v2", async ({ ack, body, view, client, logger }) 
                 style: "danger",
                 text: { type: "plain_text", text: ":bear-headshake: No", emoji: true },
                 value: JSON.stringify(ctx),
-              },
-            ],
-          },
-          {
-            type: "context",
-            elements: [
-              {
-                type: "mrkdwn",
-                text: `Tip: paste public URLs (Google Drive share links, vendor portals, etc.). If you want true *file uploads* into HubSpot, you'll need to add Slack scope *files:read* and reinstall the app.`,
               },
             ],
           },
@@ -1741,8 +1743,7 @@ function buildAttachLinksModalV2(privateMetadata) {
           text:
             "Paste *links* to files you want referenced on the HubSpot record (one per line).\n\n" +
             "• Works great for Drive/Dropbox/share links\n" +
-            "• Slack file links are OK too (they'll be saved as links)\n\n" +
-            "_Tip: If you want true file uploads from Slack into HubSpot, add the `files:read` Slack scope and reinstall the app._",
+            "• Slack file links are OK too (they'll be saved as links)",
         },
       },
       {
@@ -1903,7 +1904,8 @@ app.view("hubnote_attach_files_submit_v2", async ({ ack, body, view, client, log
     const meta = safeJsonParse(view?.private_metadata, {}) || {};
     const noteId = meta.noteId;
     const noteTitle = meta.noteTitle || "HubSpot Note";
-    if (!noteId) {
+    const noteIdStr = String(noteId || "").trim();
+    if (!noteIdStr || !/^\d+$/.test(noteIdStr)) {
       await ack({
         response_action: "errors",
         errors: { files_block_v2: "Missing note context. Please run /hubnote again." },
@@ -1937,7 +1939,7 @@ app.view("hubnote_attach_files_submit_v2", async ({ ack, body, view, client, log
     // Fetch existing note props so we can append attachments + optionally append a link list.
     const existing = await hubspotRequest(
       "GET",
-      `/crm/v3/objects/notes/${encodeURIComponent(noteId)}?properties=hs_attachment_ids,hs_note_body`
+      `/crm/v3/objects/notes/${encodeURIComponent(noteIdStr)}?properties=hs_attachment_ids,hs_note_body`
     );
     const existingAttach = (existing?.properties?.hs_attachment_ids || "").trim();
     const existingBody = existing?.properties?.hs_note_body || "";
@@ -1980,15 +1982,21 @@ app.view("hubnote_attach_files_submit_v2", async ({ ack, body, view, client, log
     const uniqueIds = Array.from(new Set(combinedIds));
 
     // Optional: also append a human-friendly list of file links into the note body.
-    const linkLines = uploadedHubSpotFiles
-      .map((f) => (f.url ? `• ${f.name || "File"}: ${f.url}` : null))
+    const linkLinesHtml = uploadedHubSpotFiles
+      .map((f) => {
+        if (!f?.url) return null;
+        const name = escapeHtml(f.name || "File");
+        const url = escapeHtml(f.url);
+        return `• ${name}: ${url}`;
+      })
       .filter(Boolean)
-      .join("\n");
-    const appendedBody = linkLines
-      ? `${existingBody || ""}\n\n📎 Attachments added via Slack:\n${linkLines}`.trim()
+      .join("<br/>");
+
+    const appendedBody = linkLinesHtml
+      ? `${existingBody || ""}<br/><br/>📎 Attachments added via Slack:<br/>${linkLinesHtml}`.trim()
       : existingBody;
 
-    await hsPatchNote(noteId, {
+    await hsPatchNote(noteIdStr, {
       hs_attachment_ids: uniqueIds.join(";"),
       ...(appendedBody ? { hs_note_body: appendedBody } : {}),
     });
