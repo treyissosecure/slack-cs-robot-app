@@ -1536,18 +1536,27 @@ app.view("hubnote_modal_submit_v2", async ({ ack, body, view, client, logger }) 
             },
           },
           {
+            type: "context",
+            elements: [
+              { type: "mrkdwn", text: `:meow-nod:\n*Yes*` },
+              { type: "mrkdwn", text: `:bear-headshake:\n*No*` },
+            ],
+          },
+          {
             type: "actions",
             elements: [
               {
                 type: "button",
                 action_id: "hubnote_v2_attach_yes",
-                text: { type: "plain_text", text: "✅ Yes" },
+                style: "primary",
+                text: { type: "plain_text", text: "Yes" },
                 value: JSON.stringify(ctx),
               },
               {
                 type: "button",
                 action_id: "hubnote_v2_attach_no",
-                text: { type: "plain_text", text: "❌ No" },
+                style: "danger",
+                text: { type: "plain_text", text: "No" },
                 value: JSON.stringify(ctx),
               },
             ],
@@ -1616,7 +1625,9 @@ function buildAttachLinksModalV2(privateMetadata) {
   };
 }
 
-app.action("hubnote_attach_yes_v2", async ({ ack, body, client, logger }) => {
+// Attachment prompt buttons (Yes/No)
+// IMPORTANT: Always ack() immediately to avoid the 3-second timeout.
+app.action("hubnote_v2_attach_yes", async ({ ack, body, client, logger }) => {
   await ack();
   try {
     const payload = safeJsonParse(body?.actions?.[0]?.value, {}) || {};
@@ -1629,7 +1640,7 @@ app.action("hubnote_attach_yes_v2", async ({ ack, body, client, logger }) => {
   }
 });
 
-app.action("hubnote_attach_no_v2", async ({ ack, body, client, logger }) => {
+app.action("hubnote_v2_attach_no", async ({ ack, body, client, logger }) => {
   await ack();
   try {
     const channel = body?.channel?.id;
