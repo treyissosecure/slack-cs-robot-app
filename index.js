@@ -317,6 +317,19 @@ function findSelectedOptionValue(viewStateValues, actionId) {
   return "";
 }
 
+// Finds Slack file IDs from view.state.values regardless of block_id
+function findFileIds(viewStateValues, actionId) {
+  const blocks = viewStateValues || {};
+  for (const blockId of Object.keys(blocks)) {
+    const actions = blocks[blockId] || {};
+    const candidate = actions[actionId];
+    const files = candidate?.files;
+    if (Array.isArray(files) && files.length) return files;
+  }
+  return [];
+}
+
+
 function option(text, value) {
   return { text: { type: "plain_text", text }, value: String(value) };
 }
@@ -899,6 +912,23 @@ async function hsCreateNoteAndAssociate({
   };
 }
 
+
+
+// Fetch existing note body so we can append attachments after creation
+async function hsGetNoteBody(noteId) {
+  const data = await hubspotRequest(
+    "GET",
+    `/crm/v3/objects/notes/${noteId}?properties=hs_note_body`
+  );
+  return data?.properties?.hs_note_body || "";
+}
+
+// Update note body (used to append attachment links)
+async function hsUpdateNoteBody(noteId, hs_note_body) {
+  await hubspotRequest("PATCH", `/crm/v3/objects/notes/${noteId}`, {
+    properties: { hs_note_body },
+  });
+}
 // ==============================
 // /api/hubnote/create  (Zap Step 2 target)
 // ==============================
@@ -1036,14 +1066,14 @@ function buildHubnoteAddFilesEphemeral({ sessionId }) {
             type: "button",
             action_id: "hubnote_add_files_yes",
             style: "primary",
-            text: { type: "plain_text", text: ":meow_nod: Yes" },
+            text: { type: "plain_text", text: ":meow_nod: Yes", emoji: true },
             value: sessionId,
           },
           {
             type: "button",
             action_id: "hubnote_add_files_no",
             style: "danger",
-            text: { type: "plain_text", text: ":bear-headshake: No" },
+            text: { type: "plain_text", text: ":bear-headshake: No", emoji: true },
             value: sessionId,
           },
         ],
@@ -1560,7 +1590,7 @@ app.view("hubnote_modal_submit_v2", async ({ ack, body, view, client, logger }) 
                 type: "button",
                 action_id: "hubnote_v2_attach_yes",
                 style: "primary",
-                text: { type: "plain_text", text: ":meow-nod: Yes", emoji: true },
+                text: { type: "plain_text", text: ":meow_nod: Yes", emoji: true },
                 value: JSON.stringify(ctx),
               },
               {
@@ -1635,6 +1665,39 @@ function buildAttachLinksModalV2(privateMetadata) {
     ],
   };
 }
+
+function buildAttachFilesModalV2({ correlationId, noteId }) {
+  return {
+    type: "modal",
+    callback_id: "hubnote_attach_files_submit_v2",
+    title: { type: "plain_text", text: "Attach files" },
+    submit: { type: "plain_text", text: "Attach" },
+    close: { type: "plain_text", text: "Cancel" },
+    private_metadata: JSON.stringify({ correlationId, noteId }),
+    blocks: [
+      {
+        type: "section",
+        text: {
+          type: "mrkdwn",
+          text:
+            "Upload up to 5 files. I’ll add them to the HubSpot note as links (you can also drag/drop into HubSpot if you prefer).",
+        },
+      },
+      {
+        type: "input",
+        block_id: "files_block_v2",
+        optional: false,
+        label: { type: "plain_text", text: "Files" },
+        element: {
+          type: "file_input",
+          action_id: "hubnote_v2_files_input",
+          max_files: 5,
+        },
+      },
+    ],
+  };
+}
+
 
 // Attachment prompt buttons (Yes/No)
 // IMPORTANT: Always ack() immediately to avoid the 3-second timeout.
