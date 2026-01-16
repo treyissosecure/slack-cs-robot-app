@@ -190,6 +190,18 @@ function buildHubnoteModalV2({ correlationId, originChannelId, originUserId }) {
       },
       {
         type: "input",
+        block_id: "files_block_v2",
+        optional: true,
+        label: { type: "plain_text", text: "Attachments" },
+        element: {
+          type: "file_input",
+          action_id: "hubnote_v2_files_input",
+          filetypes: ["png", "jpg", "jpeg", "pdf", "doc", "docx", "xls", "xlsx", "csv", "txt"],
+          max_files: 5,
+        },
+      },
+      {
+        type: "input",
         block_id: "note_title_block_v2",
         label: { type: "plain_text", text: "Note Title / Subject" },
         element: {
@@ -315,6 +327,103 @@ const cache = {
   boards: { at: 0, options: [] },
   groupsByBoard: new Map(),
 };
+
+// ==============================
+// HUBNOTE V2 - FILE ATTACHMENTS HELPERS
+// ==============================
+
+/**
+ * Slack file_input state values can vary slightly. This helper finds file IDs by action_id,
+ * regardless of block_id.
+ */
+function findFileInputIds(viewStateValues, actionId) {
+  const blocks = viewStateValues || {};
+  for (const blockId of Object.keys(blocks)) {
+    const actions = blocks[blockId] || {};
+    const node = actions[actionId];
+    if (!node) continue;
+
+    // Common shape: { type: 'file_input', files: ['F123', ...] }
+    if (Array.isArray(node.files)) {
+      return node.files
+        .map((f) => (typeof f === 'string' ? f : (f && (f.id || f.file_id || f.file || f.value))))
+        .filter(Boolean);
+    }
+
+    // Sometimes nested: { selected_files: [...] }
+    if (Array.isArray(node.selected_files)) {
+      return node.selected_files
+        .map((f) => (typeof f === 'string' ? f : (f && (f.id || f.file_id || f.file || f.value))))
+        .filter(Boolean);
+    }
+  }
+  return [];
+}
+
+async function slackDownloadFileBuffer({ client, token, fileId }) {
+  const info = await client.files.info({ file: fileId });
+  if (!info || !info.ok || !info.file) {
+    throw new Error(`Slack files.info failed for ${fileId}`);
+  }
+
+  const file = info.file;
+  const url = file.url_private_download || file.url_private;
+  if (!url) throw new Error(`Slack file missing url_private(_download) for ${fileId}`);
+
+  const res = await fetch(url, {
+    headers: {
+      Authorization: `Bearer ${token}`,
+    },
+  });
+  if (!res.ok) {
+    const txt = await res.text().catch(() => '');
+    throw new Error(`Slack file download failed (${res.status}) ${txt}`);
+  }
+  const ab = await res.arrayBuffer();
+  const buf = Buffer.from(ab);
+
+  const filename = file.name || `slack_file_${fileId}`;
+  const mimetype = file.mimetype || 'application/octet-stream';
+  return { buf, filename, mimetype };
+}
+
+/**
+ * Upload a Slack file into HubSpot Files and return the HubSpot file ID.
+ * Uses HubSpot Files API v3 (multipart/form-data).
+ */
+async function hubspotUploadSlackFile({ slackClient, slackBotToken, hubspotToken, slackFileId, folderPath }) {
+  const { buf, filename, mimetype } = await slackDownloadFileBuffer({
+    client: slackClient,
+    token: slackBotToken,
+    fileId: slackFileId,
+  });
+
+  const form = new FormData();
+  form.append('file', new Blob([buf], { type: mimetype }), filename);
+  form.append('options', JSON.stringify({ access: 'PRIVATE' }));
+  form.append('folderPath', folderPath || '/Slack Uploads');
+  form.append('fileName', filename);
+
+  const resp = await fetch('https://api.hubapi.com/files/v3/files', {
+    method: 'POST',
+    headers: {
+      Authorization: `Bearer ${hubspotToken}`,
+    },
+    body: form,
+  });
+
+  const json = await resp.json().catch(() => ({}));
+  if (!resp.ok) {
+    throw new Error(`HubSpot file upload failed (${resp.status}): ${JSON.stringify(json)}`);
+  }
+
+  // Typical shape includes "id"
+  const fileId = json.id || json.fileId || json.objectId;
+  if (!fileId) {
+    throw new Error(`HubSpot upload response missing file id: ${JSON.stringify(json)}`);
+  }
+  return String(fileId);
+}
 
 async function mondayGraphQL(query, variables = {}) {
   if (!MONDAY_API_TOKEN) throw new Error("Missing MONDAY_API_TOKEN");
@@ -844,6 +953,7 @@ async function hsCreateNoteAndAssociate({
   hubspot_object_id,
   note_title,
   note_body,
+  hubspot_attachment_ids = [],
 }) {
   const toPlural = hubspot_object_type === "deal" ? "deals" : "tickets";
   const assocTypeId = await hsGetNoteAssociationTypeId(toPlural);
@@ -856,6 +966,9 @@ async function hsCreateNoteAndAssociate({
       // hs_timestamp is a datetime property; HubSpot accepts milliseconds since epoch.
       hs_timestamp: String(Date.now()),
       hs_note_body: combinedBody,
+      ...(hubspot_attachment_ids && hubspot_attachment_ids.length
+        ? { hs_attachment_ids: hubspot_attachment_ids.join(";") }
+        : {}),
     },
     associations: [
       {
@@ -1549,14 +1662,6 @@ app.view("hubnote_attach_modal_submit", async ({ ack, body, view, client, logger
   }
 });
 
-// ==============================
-// START SERVER
-// ==============================
-(async () => {
-  await app.start(process.env.PORT || 3000);
-  console.log("⚡️ SyllaBot is running (cstask + hubnote v2)");
-})();
-
 
 /**
  * Handle modal submission (Create button)
@@ -1598,12 +1703,35 @@ app.view("hubnote_modal_submit_v2", async ({ ack, body, view, client, logger }) 
       return;
     }
 
+    // Optional: upload Slack files to HubSpot and attach to the note.
+    // This uses Slack's `file_input` element in the modal (if the workspace has it enabled).
+    const slackFileIds = findFileInputIds(values, "hubnote_v2_files_input");
+    let hubspotAttachmentIds = [];
+    if (slackFileIds.length) {
+      const uploaded = [];
+      for (const slackFileId of slackFileIds) {
+        try {
+          const hubspotFileId = await hubspotUploadSlackFile({
+            slackClient: client,
+            slackFileId,
+            folderPath: "/slack-uploads",
+            logger,
+          });
+          if (hubspotFileId) uploaded.push(hubspotFileId);
+        } catch (e) {
+          logger?.warn?.({ slackFileId, err: String(e) }, "Failed uploading Slack file to HubSpot");
+        }
+      }
+      hubspotAttachmentIds = uploaded;
+    }
+
     // Create note + associate to Ticket/Deal
     const noteId = await hsCreateNoteAndAssociate({
       hubspot_object_type: recordType,
       hubspot_object_id: recordId,
       note_title: noteTitle,
       note_body: noteBody,
+      hubspot_attachment_ids: hubspotAttachmentIds,
     });
 
     await ack({ response_action: "clear" });
@@ -1628,3 +1756,11 @@ app.view("hubnote_modal_submit_v2", async ({ ack, body, view, client, logger }) 
     });
   }
 });
+
+// ==============================
+// START SERVER
+// ==============================
+(async () => {
+  await app.start(process.env.PORT || 3000);
+  console.log("⚡️ SyllaBot is running (cstask + hubnote v2)");
+})();
