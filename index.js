@@ -190,18 +190,6 @@ function buildHubnoteModalV2({ correlationId, originChannelId, originUserId }) {
       },
       {
         type: "input",
-        block_id: "files_block_v2",
-        optional: true,
-        label: { type: "plain_text", text: "Attachments" },
-        element: {
-          type: "file_input",
-          action_id: "hubnote_v2_files_input",
-          filetypes: ["png", "jpg", "jpeg", "pdf", "doc", "docx", "xls", "xlsx", "csv", "txt"],
-          max_files: 5,
-        },
-      },
-      {
-        type: "input",
         block_id: "note_title_block_v2",
         label: { type: "plain_text", text: "Note Title / Subject" },
         element: {
@@ -327,103 +315,6 @@ const cache = {
   boards: { at: 0, options: [] },
   groupsByBoard: new Map(),
 };
-
-// ==============================
-// HUBNOTE V2 - FILE ATTACHMENTS HELPERS
-// ==============================
-
-/**
- * Slack file_input state values can vary slightly. This helper finds file IDs by action_id,
- * regardless of block_id.
- */
-function findFileInputIds(viewStateValues, actionId) {
-  const blocks = viewStateValues || {};
-  for (const blockId of Object.keys(blocks)) {
-    const actions = blocks[blockId] || {};
-    const node = actions[actionId];
-    if (!node) continue;
-
-    // Common shape: { type: 'file_input', files: ['F123', ...] }
-    if (Array.isArray(node.files)) {
-      return node.files
-        .map((f) => (typeof f === 'string' ? f : (f && (f.id || f.file_id || f.file || f.value))))
-        .filter(Boolean);
-    }
-
-    // Sometimes nested: { selected_files: [...] }
-    if (Array.isArray(node.selected_files)) {
-      return node.selected_files
-        .map((f) => (typeof f === 'string' ? f : (f && (f.id || f.file_id || f.file || f.value))))
-        .filter(Boolean);
-    }
-  }
-  return [];
-}
-
-async function slackDownloadFileBuffer({ client, token, fileId }) {
-  const info = await client.files.info({ file: fileId });
-  if (!info || !info.ok || !info.file) {
-    throw new Error(`Slack files.info failed for ${fileId}`);
-  }
-
-  const file = info.file;
-  const url = file.url_private_download || file.url_private;
-  if (!url) throw new Error(`Slack file missing url_private(_download) for ${fileId}`);
-
-  const res = await fetch(url, {
-    headers: {
-      Authorization: `Bearer ${token}`,
-    },
-  });
-  if (!res.ok) {
-    const txt = await res.text().catch(() => '');
-    throw new Error(`Slack file download failed (${res.status}) ${txt}`);
-  }
-  const ab = await res.arrayBuffer();
-  const buf = Buffer.from(ab);
-
-  const filename = file.name || `slack_file_${fileId}`;
-  const mimetype = file.mimetype || 'application/octet-stream';
-  return { buf, filename, mimetype };
-}
-
-/**
- * Upload a Slack file into HubSpot Files and return the HubSpot file ID.
- * Uses HubSpot Files API v3 (multipart/form-data).
- */
-async function hubspotUploadSlackFile({ slackClient, slackBotToken, hubspotToken, slackFileId, folderPath }) {
-  const { buf, filename, mimetype } = await slackDownloadFileBuffer({
-    client: slackClient,
-    token: slackBotToken,
-    fileId: slackFileId,
-  });
-
-  const form = new FormData();
-  form.append('file', new Blob([buf], { type: mimetype }), filename);
-  form.append('options', JSON.stringify({ access: 'PRIVATE' }));
-  form.append('folderPath', folderPath || '/Slack Uploads');
-  form.append('fileName', filename);
-
-  const resp = await fetch('https://api.hubapi.com/files/v3/files', {
-    method: 'POST',
-    headers: {
-      Authorization: `Bearer ${hubspotToken}`,
-    },
-    body: form,
-  });
-
-  const json = await resp.json().catch(() => ({}));
-  if (!resp.ok) {
-    throw new Error(`HubSpot file upload failed (${resp.status}): ${JSON.stringify(json)}`);
-  }
-
-  // Typical shape includes "id"
-  const fileId = json.id || json.fileId || json.objectId;
-  if (!fileId) {
-    throw new Error(`HubSpot upload response missing file id: ${JSON.stringify(json)}`);
-  }
-  return String(fileId);
-}
 
 async function mondayGraphQL(query, variables = {}) {
   if (!MONDAY_API_TOKEN) throw new Error("Missing MONDAY_API_TOKEN");
@@ -953,7 +844,6 @@ async function hsCreateNoteAndAssociate({
   hubspot_object_id,
   note_title,
   note_body,
-  hubspot_attachment_ids = [],
 }) {
   const toPlural = hubspot_object_type === "deal" ? "deals" : "tickets";
   const assocTypeId = await hsGetNoteAssociationTypeId(toPlural);
@@ -966,9 +856,6 @@ async function hsCreateNoteAndAssociate({
       // hs_timestamp is a datetime property; HubSpot accepts milliseconds since epoch.
       hs_timestamp: String(Date.now()),
       hs_note_body: combinedBody,
-      ...(hubspot_attachment_ids && hubspot_attachment_ids.length
-        ? { hs_attachment_ids: hubspot_attachment_ids.join(";") }
-        : {}),
     },
     associations: [
       {
@@ -1147,50 +1034,6 @@ function buildHubnoteAddFilesEphemeral({ sessionId }) {
   };
 }
 
-function buildHubnoteAttachModal({ sessionId }) {
-  return {
-    type: "modal",
-    callback_id: "hubnote_attach_modal_submit",
-    title: { type: "plain_text", text: "Attach Files" },
-    submit: { type: "plain_text", text: "Attach" },
-    close: { type: "plain_text", text: "Cancel" },
-    private_metadata: JSON.stringify({ sessionId }),
-    blocks: [
-      {
-        type: "section",
-        text: {
-          type: "mrkdwn",
-          text:
-            "Select file(s) to attach.\n\n" +
-            "_Tip: upload the file(s) to Slack first, then search/select them here._",
-        },
-      },
-      {
-        type: "input",
-        block_id: "files_select_block",
-        label: { type: "plain_text", text: "Files to attach" },
-        element: {
-          type: "multi_external_select",
-          action_id: "hubnote_files_select",
-          placeholder: { type: "plain_text", text: "Search your Slack files" },
-          min_query_length: 0,
-        },
-      },
-      {
-        type: "input",
-        optional: true,
-        block_id: "attach_note_block",
-        label: { type: "plain_text", text: "Optional message" },
-        element: {
-          type: "plain_text_input",
-          action_id: "attach_note_input",
-          multiline: true,
-          placeholder: { type: "plain_text", text: "Anything to add about these attachments?" },
-        },
-      },
-    ],
-  };
-}
 
 // ==============================
 // /zapier/hubnote/callback  (Zap Step 3 target)
@@ -1326,7 +1169,7 @@ app.action("hubnote_add_files_yes", async ({ ack, body, client, logger }) => {
 
     await client.views.open({
       trigger_id: body.trigger_id,
-      view: buildHubnoteAttachModal({ sessionId }),
+      view: buildAttachLinksModalV2({ sessionId }),
     });
   } catch (e) {
     logger.error(e);
@@ -1613,54 +1456,10 @@ app.options("hubnote_files_select", async ({ ack, body, options, client, logger 
 // is typically done in Zapier using Slack File download + HubSpot file upload + associate.
 // If your Zap currently expects to handle the file part later, keep this as-is.
 //
-app.view("hubnote_attach_modal_submit", async ({ ack, body, view, client, logger }) => {
-  try {
-    const meta = parsePrivateMetadata(view.private_metadata);
-    const sessionId = meta.sessionId || "";
-    const session = hubnoteGetSession(sessionId);
 
-    if (!session) {
-      await ack();
-      return;
-    }
-
-    const selected =
-      view.state.values.files_select_block.hubnote_files_select.selected_options || [];
-
-    const slackFileIds = selected.map((o) => o.value).filter(Boolean);
-
-    if (!slackFileIds.length) {
-      await ack({
-        response_action: "errors",
-        errors: { files_select_block: "Select at least one file." },
-      });
-      return;
-    }
-
-    await ack();
-
-    const attachNote =
-      view.state.values.attach_note_block?.attach_note_input?.value?.trim() || "";
-
-    // For now we just confirm success to the user.
-    // If you want Zap handling: add a Zapier webhook call here (optional).
-    await client.chat.postMessage({
-      channel: session.originUserId,
-      text:
-        `✅ Got it. Selected ${slackFileIds.length} file(s).\n` +
-        `• Slack File IDs: ${slackFileIds.join(", ")}\n` +
-        (attachNote ? `• Note: ${attachNote}` : ""),
-    });
-
-    // Keep session alive in case user adds more; or delete it:
-    // hubnoteDeleteSession(sessionId);
-  } catch (e) {
-    logger.error(e);
-    try {
-      await ack();
-    } catch (_) {}
-  }
-});
+// ==============================
+// START SERVER
+// ==============================
 
 
 /**
@@ -1703,45 +1502,66 @@ app.view("hubnote_modal_submit_v2", async ({ ack, body, view, client, logger }) 
       return;
     }
 
-    // Optional: upload Slack files to HubSpot and attach to the note.
-    // This uses Slack's `file_input` element in the modal (if the workspace has it enabled).
-    const slackFileIds = findFileInputIds(values, "hubnote_v2_files_input");
-    let hubspotAttachmentIds = [];
-    if (slackFileIds.length) {
-      const uploaded = [];
-      for (const slackFileId of slackFileIds) {
-        try {
-          const hubspotFileId = await hubspotUploadSlackFile({
-            slackClient: client,
-            slackFileId,
-            folderPath: "/slack-uploads",
-            logger,
-          });
-          if (hubspotFileId) uploaded.push(hubspotFileId);
-        } catch (e) {
-          logger?.warn?.({ slackFileId, err: String(e) }, "Failed uploading Slack file to HubSpot");
-        }
-      }
-      hubspotAttachmentIds = uploaded;
-    }
-
     // Create note + associate to Ticket/Deal
     const noteId = await hsCreateNoteAndAssociate({
       hubspot_object_type: recordType,
       hubspot_object_id: recordId,
       note_title: noteTitle,
       note_body: noteBody,
-      hubspot_attachment_ids: hubspotAttachmentIds,
     });
 
     await ack({ response_action: "clear" });
 
-    // Optional: confirmation (DM the user so we don't need an origin channel)
+    // Confirmation + follow-up (DM the user so we don't need an origin channel)
+    // We intentionally do NOT use Slack's `file_input` block element here because it requires the `files:read` scope.
+    // Instead, we offer an optional follow-up flow to add attachment LINKS as a second HubSpot note.
     const userId = body?.user?.id;
     if (userId) {
+      const ctx = {
+        recordType,
+        recordId,
+        noteId: noteId || "",
+        noteTitle,
+      };
+
       await client.chat.postMessage({
         channel: userId,
         text: `✅ HubSpot note created and attached to ${recordType} ${recordId}${noteId ? ` (note ${noteId})` : ""}.`,
+        blocks: [
+          {
+            type: "section",
+            text: {
+              type: "mrkdwn",
+              text: `✅ *HubSpot note created!*\n\n:paperclip: Do you want to add attachment *links* to this note?`,
+            },
+          },
+          {
+            type: "actions",
+            elements: [
+              {
+                type: "button",
+                action_id: "hubnote_v2_attach_yes",
+                text: { type: "plain_text", text: "✅ Yes" },
+                value: JSON.stringify(ctx),
+              },
+              {
+                type: "button",
+                action_id: "hubnote_v2_attach_no",
+                text: { type: "plain_text", text: "❌ No" },
+                value: JSON.stringify(ctx),
+              },
+            ],
+          },
+          {
+            type: "context",
+            elements: [
+              {
+                type: "mrkdwn",
+                text: `Tip: paste public URLs (Google Drive share links, vendor portals, etc.). If you want true *file uploads* into HubSpot, you'll need to add Slack scope *files:read* and reinstall the app.`,
+              },
+            ],
+          },
+        ],
       });
     }
   } catch (err) {
@@ -1753,6 +1573,147 @@ app.view("hubnote_modal_submit_v2", async ({ ack, body, view, client, logger }) 
       errors: {
         note_body_block_v2: "Something went wrong creating the note. Please try again (or contact Trey if it persists).",
       },
+    });
+  }
+});
+
+// ==============================
+// HubSpot Note v2: attachment follow-up (LINKS)
+// ==============================
+
+function buildAttachLinksModalV2(privateMetadata) {
+  return {
+    type: "modal",
+    callback_id: "hubnote_attach_links_submit_v2",
+    title: { type: "plain_text", text: "Add attachments" },
+    close: { type: "plain_text", text: "Cancel" },
+    submit: { type: "plain_text", text: "Add" },
+    private_metadata: JSON.stringify(privateMetadata || {}),
+    blocks: [
+      {
+        type: "section",
+        text: {
+          type: "mrkdwn",
+          text:
+            "Paste *links* to files you want referenced on the HubSpot record (one per line).\n\n" +
+            "• Works great for Drive/Dropbox/share links\n" +
+            "• Slack file links are OK too (they'll be saved as links)\n\n" +
+            "_Tip: If you want true file uploads from Slack into HubSpot, add the `files:read` Slack scope and reinstall the app._",
+        },
+      },
+      {
+        type: "input",
+        block_id: "attach_links_block_v2",
+        label: { type: "plain_text", text: "Attachment links" },
+        element: {
+          type: "plain_text_input",
+          action_id: "hubnote_attach_links_input_v2",
+          multiline: true,
+          placeholder: { type: "plain_text", text: "https://...\nhttps://..." },
+        },
+      },
+    ],
+  };
+}
+
+app.action("hubnote_attach_yes_v2", async ({ ack, body, client, logger }) => {
+  await ack();
+  try {
+    const payload = safeJsonParse(body?.actions?.[0]?.value, {}) || {};
+    await client.views.open({
+      trigger_id: body.trigger_id,
+      view: buildAttachLinksModalV2(payload),
+    });
+  } catch (e) {
+    logger.error(e);
+  }
+});
+
+app.action("hubnote_attach_no_v2", async ({ ack, body, client, logger }) => {
+  await ack();
+  try {
+    const channel = body?.channel?.id;
+    const ts = body?.message?.ts;
+    if (!channel || !ts) return;
+    await client.chat.update({
+      channel,
+      ts,
+      text: "👍 No attachments added.",
+      blocks: [
+        {
+          type: "section",
+          text: { type: "mrkdwn", text: "👍 No attachments added." },
+        },
+      ],
+    });
+  } catch (e) {
+    logger.error(e);
+  }
+});
+
+app.view("hubnote_attach_links_submit_v2", async ({ ack, body, view, client, logger }) => {
+  try {
+    const meta = safeJsonParse(view?.private_metadata, {}) || {};
+    const linksRaw =
+      view?.state?.values?.attach_links_block_v2?.hubnote_attach_links_input_v2?.value || "";
+    const links = linksRaw
+      .split(/\r?\n/)
+      .map((s) => s.trim())
+      .filter(Boolean);
+
+    if (!links.length) {
+      await ack({
+        response_action: "errors",
+        errors: { attach_links_block_v2: "Please paste at least one link." },
+      });
+      return;
+    }
+
+    await ack();
+
+    const recordType = meta.recordType;
+    const recordId = meta.recordId;
+    const originalNoteId = meta.noteId;
+    const noteTitle = meta.noteTitle || "HubSpot Note";
+
+    if (!recordType || !recordId) {
+      // Can't proceed; just DM the user.
+      const userId = body?.user?.id;
+      if (userId) {
+        await client.chat.postMessage({
+          channel: userId,
+          text: "⚠️ I couldn't determine which HubSpot record to attach links to.",
+        });
+      }
+      return;
+    }
+
+    const bodyText =
+      `📎 Attachments for: ${noteTitle}` +
+      (originalNoteId ? ` (original note: ${originalNoteId})` : "") +
+      "\n\n" +
+      links.map((u) => `• ${u}`).join("\n");
+
+    const attachmentNoteId = await hsCreateNoteAndAssociate({
+      hubspot_object_type: recordType,
+      hubspot_object_id: recordId,
+      note_title: `📎 Attachments — ${noteTitle}`,
+      note_body: bodyText,
+    });
+
+    // DM confirmation
+    const userId = body?.user?.id;
+    if (userId) {
+      await client.chat.postMessage({
+        channel: userId,
+        text: `✅ Added attachment links as a new HubSpot note${attachmentNoteId ? ` (note ${attachmentNoteId})` : ""}.`,
+      });
+    }
+  } catch (e) {
+    logger.error(e);
+    await ack({
+      response_action: "errors",
+      errors: { attach_links_block_v2: "Something went wrong. Please try again." },
     });
   }
 });
