@@ -273,6 +273,24 @@ function parsePrivateMetadata(md) {
   }
 }
 
+// Safe JSON helpers for private_metadata and other small payloads.
+function safeJsonParse(str, fallback = {}) {
+  try {
+    if (str == null || str === "") return fallback;
+    return JSON.parse(str);
+  } catch {
+    return fallback;
+  }
+}
+
+function safeJsonStringify(obj, fallback = "{}") {
+  try {
+    return JSON.stringify(obj ?? {});
+  } catch {
+    return fallback;
+  }
+}
+
 function buildCleanViewPayload(view, privateMetadataString) {
   return {
     type: "modal",
@@ -1536,27 +1554,20 @@ app.view("hubnote_modal_submit_v2", async ({ ack, body, view, client, logger }) 
             },
           },
           {
-            type: "context",
-            elements: [
-              { type: "mrkdwn", text: `:meow-nod:\n*Yes*` },
-              { type: "mrkdwn", text: `:bear-headshake:\n*No*` },
-            ],
-          },
-          {
             type: "actions",
             elements: [
               {
                 type: "button",
                 action_id: "hubnote_v2_attach_yes",
                 style: "primary",
-                text: { type: "plain_text", text: "Yes" },
+                text: { type: "plain_text", text: ":meow-nod: Yes", emoji: true },
                 value: JSON.stringify(ctx),
               },
               {
                 type: "button",
                 action_id: "hubnote_v2_attach_no",
                 style: "danger",
-                text: { type: "plain_text", text: "No" },
+                text: { type: "plain_text", text: ":bear-headshake: No", emoji: true },
                 value: JSON.stringify(ctx),
               },
             ],
