@@ -85,24 +85,10 @@ receiver.app.use((req, res, next) => {
   next();
 });
 
-// Helpful: log 404s
-receiver.app.use((req, res, next) => {
-  // Only runs if no route handled it
-  res.status(404).send("Not Found");
-  console.log("[404]", req.method, req.originalUrl);
-});
-
-// Basic request logging (keep while debugging)
-receiver.app.use((req, res, next) => {
-  console.log(
-    "[REQ]",
-    req.method,
-    req.originalUrl,
-    "CT:",
-    req.headers["content-type"]
-  );
-  next();
-});
+// NOTE: Do NOT register a catch-all 404 middleware here.
+// Express executes middleware in order; a 404 handler placed this early will
+// intercept your custom routes like /api/hubnote/create and /zapier/hubnote/callback.
+// If you want a 404 logger, add it at the very bottom of this file.
 
 // Health check
 receiver.app.get("/", (req, res) => res.status(200).send("OK"));
@@ -804,9 +790,10 @@ async function hsAppendAttachmentsToNote(noteId, attachmentIds) {
   if (!noteId) throw new Error('Missing noteId');
   if (!attachmentIds?.length) return;
 
-  const current = await hubspotRequest('GET', `/crm/v3/objects/notes/${noteId}`, null, {
-    properties: 'hs_attachment_ids',
-  }).catch(() => null);
+  const current = await hubspotRequest(
+    'GET',
+    `/crm/v3/objects/notes/${noteId}?properties=hs_attachment_ids`
+  ).catch(() => null);
 
   const existing = (current?.properties?.hs_attachment_ids || '').split(';').map(s => s.trim()).filter(Boolean);
   const merged = Array.from(new Set([...existing, ...attachmentIds.map(String)])).filter(Boolean);
@@ -817,6 +804,7 @@ async function hsAppendAttachmentsToNote(noteId, attachmentIds) {
 }
 
 async function slackDownloadFileToBuffer(client, fileId) {
+  // Requires Slack OAuth scope: files:read
   const info = await client.files.info({ file: fileId });
   const f = info?.file;
   if (!f) throw new Error('Slack file not found');
@@ -1308,9 +1296,15 @@ app.action("hubnote_add_files_yes", async ({ ack, body, client, logger }) => {
       return;
     }
 
+    // Open the *file upload* modal. Uploaded files will be uploaded into HubSpot
+    // and attached to the SAME note (no new note is created).
     await client.views.open({
       trigger_id: body.trigger_id,
-      view: buildAttachLinksModalV2({ sessionId }),
+      view: buildAttachFilesModalV2({
+        correlationId: session.correlationId || "",
+        noteId: session.hubspotNoteId,
+        sessionId,
+      }),
     });
   } catch (e) {
     logger.error(e);
@@ -1644,18 +1638,20 @@ app.view("hubnote_modal_submit_v2", async ({ ack, body, view, client, logger }) 
     }
 
     // Create note + associate to Ticket/Deal
-    const noteId = await hsCreateNoteAndAssociate({
+    const created = await hsCreateNoteAndAssociate({
       hubspot_object_type: recordType,
       hubspot_object_id: recordId,
       note_title: noteTitle,
       note_body: noteBody,
     });
 
+    const noteId = created?.hubspot_note_id || "";
+
     await ack({ response_action: "clear" });
 
-    // Confirmation + follow-up (DM the user so we don't need an origin channel)
-    // We intentionally do NOT use Slack's `file_input` block element here because it requires the `files:read` scope.
-    // Instead, we offer an optional follow-up flow to add attachment LINKS as a second HubSpot note.
+    // Confirmation + optional attachment flow (DM).
+    // This uses Slack `file_input` and requires the Slack OAuth scope: files:read.
+
     const userId = body?.user?.id;
     if (userId) {
       const ctx = {
@@ -1759,14 +1755,14 @@ function buildAttachLinksModalV2(privateMetadata) {
   };
 }
 
-function buildAttachFilesModalV2({ correlationId, noteId }) {
+function buildAttachFilesModalV2({ correlationId, noteId, sessionId }) {
   return {
     type: "modal",
     callback_id: "hubnote_attach_files_submit_v2",
     title: { type: "plain_text", text: "Attach files" },
     submit: { type: "plain_text", text: "Attach" },
     close: { type: "plain_text", text: "Cancel" },
-    private_metadata: JSON.stringify({ correlationId, noteId }),
+    private_metadata: JSON.stringify({ correlationId, noteId, sessionId }),
     blocks: [
       {
         type: "section",
@@ -1904,6 +1900,7 @@ app.view("hubnote_attach_files_submit_v2", async ({ ack, body, view, client, log
   try {
     const meta = safeJsonParse(view.private_metadata, {});
     const noteId = meta?.noteId;
+    const sessionId = meta?.sessionId;
 
     if (!noteId) {
       await client.chat.postMessage({
@@ -1930,6 +1927,9 @@ app.view("hubnote_attach_files_submit_v2", async ({ ack, body, view, client, log
     }
 
     await hsAppendAttachmentsToNote(noteId, uploadedIds);
+
+    // Cleanup session (Zapier ephemeral flow)
+    if (sessionId) hubnoteDeleteSession(sessionId);
 
     await client.chat.postMessage({
       channel: body.user.id,
