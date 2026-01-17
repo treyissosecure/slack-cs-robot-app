@@ -681,10 +681,14 @@ app.view("cstask_modal_submit", async ({ ack, body, view, client, logger }) => {
     view.state.values.group_block.group_select.selected_option?.value || "";
 
   const statusLabel =
-    view.state.values.status_block.status_select.selected_option?.value || "";
+    view.state.values.status_block.status_select.selected_option?.text?.text ||
+    view.state.values.status_block.status_select.selected_option?.value ||
+    "";
 
   const priorityLabel =
-    view.state.values.priority_block.priority_select.selected_option?.value || "";
+    view.state.values.priority_block.priority_select.selected_option?.text?.text ||
+    view.state.values.priority_block.priority_select.selected_option?.value ||
+    "";
 
   const errors = {};
   if (!taskName) errors["task_name_block"] = "Task name is required.";
@@ -731,25 +735,13 @@ app.view("cstask_modal_submit", async ({ ack, body, view, client, logger }) => {
     await axios.post(
       ZAPIER_WEBHOOK_URL,
       {
-        source: "slack",
-        command_name: "cstask",
-        version: "v3.2",
         task_name: taskName,
         description,
-        task_owner_slack_user_id: ownerSlackUserId,
-        task_owner_email: taskOwnerEmail,
-        monday_board_id: boardId,
-        monday_group_id: groupId,
         status_label: statusLabel,
         priority_label: priorityLabel,
-        // Back-compat + easier Zapier mapping (some Zaps may expect different keys)
-        priority: priorityLabel,
-        monday_priority_label: priorityLabel,
-        priority_text: priorityLabel,
-        // Monday 'priority' column often accepts a JSON value with a label
-        monday_priority_value_json: JSON.stringify({ label: priorityLabel }),
-        submitted_by_slack_user_id: body.user.id,
-        submitted_at: nowIso(),
+        monday_board_id: boardId,
+        monday_group_id: groupId,
+        task_owner_slack_user_id: body.user.id,
       },
       { headers: { "Content-Type": "application/json" }, timeout: 10000 }
     );
