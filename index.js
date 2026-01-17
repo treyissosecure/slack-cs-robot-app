@@ -291,174 +291,13 @@ function safeJsonStringify(obj, fallback = "{}") {
   }
 }
 
-function escapeHtml(s) {
-  return String(s ?? "")
-    .replace(/&/g, "&amp;")
-    .replace(/</g, "&lt;")
-    .replace(/>/g, "&gt;")
-    .replace(/\"/g, "&quot;")
-    .replace(/'/g, "&#39;");
-}
-
-// Pending hubnote submissions (so we can attach files BEFORE we create the note)
-const HUBNOTE_PENDING = new Map();
-
-// ==============================
-// HUBSPOT FILE UPLOAD + NOTE ATTACHMENTS
-// ==============================
-// Uploads a file into HubSpot Files (File Manager) and returns the created file info.
-// Uses the Files API v3 multipart upload.
-async function hsUploadFileToHubSpot({ buffer, filename, mimeType, folderPath = "/slack-uploads" }) {
-  if (!HUBSPOT_PRIVATE_APP_TOKEN) {
-    throw new Error("Missing HUBSPOT_PRIVATE_APP_TOKEN");
-  }
-
-  // Node 18+ provides global FormData/Blob via undici.
-  const form = new FormData();
-  const blob = new Blob([buffer], { type: mimeType || "application/octet-stream" });
-
-  form.append("file", blob, filename || "upload.bin");
-  form.append("folderPath", folderPath);
-
-  // HubSpot expects `options` as JSON. Keep it private by default.
-  form.append(
-    "options",
-    JSON.stringify({
-      access: "PRIVATE",
-      overwrite: false,
-      duplicateValidationStrategy: "NONE",
-      duplicateValidationScope: "ENTIRE_PORTAL",
-    })
-  );
-
-  const res = await fetch("https://api.hubapi.com/files/v3/files", {
-    method: "POST",
-    headers: {
-      Authorization: `Bearer ${HUBSPOT_PRIVATE_APP_TOKEN}`,
-      // DO NOT set Content-Type manually; fetch will set the multipart boundary.
-    },
-    body: form,
-  });
-
-  const text = await res.text();
-  const data = safeJsonParse(text, null);
-  if (!res.ok) {
-    const msg = data?.message || data?.error || text;
-    throw new Error(`HubSpot file upload failed (${res.status}): ${msg}`);
-  }
-
-  // Typical response includes `id` and `url`.
-  return {
-    id: String(data?.id ?? ""),
-    url: String(data?.url ?? data?.downloadUrl ?? ""),
-    name: String(data?.name ?? filename ?? ""),
-  };
-}
-
-
-// Download a Slack file (by file ID) as a Buffer
-async function slackDownloadFileBuffer({ client, fileId }) {
-  const info = await client.files.info({ file: fileId });
-  if (!info?.file?.url_private_download) {
-    throw new Error(`Slack file ${fileId} missing url_private_download`);
-  }
-  const url = info.file.url_private_download;
-  const axios = require("axios");
-  const resp = await axios.get(url, {
-    responseType: "arraybuffer",
-    headers: { Authorization: `Bearer ${process.env.SLACK_BOT_TOKEN}` },
-  });
-  const buffer = Buffer.from(resp.data);
-  const filename = info.file.name || `slack_${fileId}`;
-  const mimetype = info.file.mimetype || "application/octet-stream";
-  return { buffer, filename, mimetype };
-}
-
-// Create a NOTE via the legacy Engagements API so we can include attachments
-async function hsCreateEngagementNoteWithAttachments({ recordType, recordId, htmlBody, fileIds = [] }) {
-  const engagement = {
-    active: true,
-    type: "NOTE",
-    timestamp: Date.now(),
-  };
-
-  const associations = {
-    contactIds: [],
-    companyIds: [],
-    dealIds: [],
-    ticketIds: [],
-  };
-
-  const numericId = Number(String(recordId).trim());
-  if (!Number.isFinite(numericId)) {
-    throw new Error(`Invalid recordId (expected numeric): ${recordId}`);
-  }
-
-  if (recordType === "deal") associations.dealIds = [numericId];
-  else if (recordType === "ticket") associations.ticketIds = [numericId];
-  else throw new Error(`Unsupported recordType for engagement note: ${recordType}`);
-
-  const attachments = fileIds.map((id) => ({ id: Number(id) })).filter((a) => Number.isFinite(a.id));
-
-  const payload = {
-    engagement,
-    associations,
-    metadata: { body: htmlBody },
-    attachments,
-  };
-
-  const url = "https://api.hubapi.com/engagements/v1/engagements";
-  const result = await fetchJson(url, {
-    method: "POST",
-    headers: {
-      Authorization: `Bearer ${process.env.HUBSPOT_PRIVATE_APP_TOKEN}`,
-      "Content-Type": "application/json",
-    },
-    body: JSON.stringify(payload),
-  });
-  return result;
-}
-
-async function hsGetNoteAttachments(noteId) {
-  const note = await hubspotRequest(
-    "GET",
-    `/crm/v3/objects/notes/${encodeURIComponent(noteId)}?properties=hs_attachment_ids,hs_note_body`
-  );
-  const props = note?.properties || {};
-  const raw = String(props.hs_attachment_ids || "").trim();
-  const ids = raw ? raw.split(";").map((s) => s.trim()).filter(Boolean) : [];
-  return { ids, body: String(props.hs_note_body || "") };
-}
-
-async function hsPatchNote(noteId, properties) {
-  return hubspotRequest("PATCH", `/crm/v3/objects/notes/${encodeURIComponent(noteId)}`, {
-    properties,
-  });
-}
-
-async function slackDownloadFile({ client, slackFileId }) {
-  const info = await client.files.info({ file: slackFileId });
-  if (!info?.ok) {
-    throw new Error(`Slack files.info failed for ${slackFileId}`);
-  }
-
-  const f = info.file || {};
-  const url = f.url_private_download || f.url_private;
-  if (!url) throw new Error(`Slack file ${slackFileId} missing url_private_download`);
-
-  const filename = f.name || `slack_${slackFileId}`;
-  const mimeType = f.mimetype || "application/octet-stream";
-
-  const resp = await axios.get(url, {
-    responseType: "arraybuffer",
-    headers: { Authorization: `Bearer ${process.env.SLACK_BOT_TOKEN}` },
-  });
-
-  return {
-    buffer: Buffer.from(resp.data),
-    filename,
-    mimeType,
-  };
+function escapeHtml(str) {
+  return String(str ?? '')
+    .replace(/&/g, '&amp;')
+    .replace(/</g, '&lt;')
+    .replace(/>/g, '&gt;')
+    .replace(/"/g, '&quot;')
+    .replace(/'/g, '&#39;');
 }
 
 function buildCleanViewPayload(view, privateMetadataString) {
@@ -483,18 +322,6 @@ function findSelectedOptionValue(viewStateValues, actionId) {
     const actions = blocks[blockId] || {};
     const v = actions[actionId]?.selected_option?.value;
     if (v) return v;
-  }
-  return "";
-}
-
-// Slack view.state.values can shift if block_id changes.
-// This helper finds plain_text_input.value by action_id regardless of block_id.
-function findPlainTextValue(viewStateValues, actionId) {
-  const blocks = viewStateValues || {};
-  for (const blockId of Object.keys(blocks)) {
-    const actions = blocks[blockId] || {};
-    const v = actions[actionId]?.value;
-    if (typeof v === "string" && v.length) return v;
   }
   return "";
 }
@@ -941,6 +768,90 @@ async function hubspotRequest(method, path, data) {
   return res.data;
 }
 
+
+// ==============================
+// HUBSPOT FILE UPLOAD + NOTE ATTACHMENTS
+// ==============================
+async function hsUploadFileFromBuffer({ filename, buffer, mimeType }) {
+  if (!HUBSPOT_PRIVATE_APP_TOKEN) throw new Error('Missing HUBSPOT_PRIVATE_APP_TOKEN');
+
+  const fd = new FormData();
+  const blob = new Blob([buffer], { type: mimeType || 'application/octet-stream' });
+  fd.append('file', blob, filename);
+  fd.append('fileName', filename);
+  fd.append('options', JSON.stringify({ access: 'PRIVATE', overwrite: false }));
+
+  const res = await fetch('https://api.hubapi.com/files/v3/files', {
+    method: 'POST',
+    headers: { Authorization: `Bearer ${HUBSPOT_PRIVATE_APP_TOKEN}` },
+    body: fd,
+  });
+
+  const data = await res.json().catch(() => ({}));
+  if (!res.ok) {
+    const msg = data?.message || data?.error || `HubSpot file upload failed (${res.status})`;
+    const err = new Error(msg);
+    err.status = res.status;
+    err.data = data;
+    throw err;
+  }
+
+  // Files API returns an object containing `id`
+  return data;
+}
+
+async function hsAppendAttachmentsToNote(noteId, attachmentIds) {
+  if (!noteId) throw new Error('Missing noteId');
+  if (!attachmentIds?.length) return;
+
+  const current = await hubspotRequest('GET', `/crm/v3/objects/notes/${noteId}`, null, {
+    properties: 'hs_attachment_ids',
+  }).catch(() => null);
+
+  const existing = (current?.properties?.hs_attachment_ids || '').split(';').map(s => s.trim()).filter(Boolean);
+  const merged = Array.from(new Set([...existing, ...attachmentIds.map(String)])).filter(Boolean);
+
+  await hubspotRequest('PATCH', `/crm/v3/objects/notes/${noteId}`, {
+    properties: { hs_attachment_ids: merged.join(';') },
+  });
+}
+
+async function slackDownloadFileToBuffer(client, fileId) {
+  const info = await client.files.info({ file: fileId });
+  const f = info?.file;
+  if (!f) throw new Error('Slack file not found');
+
+  const url = f.url_private_download || f.url_private;
+  if (!url) throw new Error('Slack file missing download URL');
+
+  const res = await fetch(url, {
+    headers: { Authorization: `Bearer ${process.env.SLACK_BOT_TOKEN}` },
+  });
+  if (!res.ok) throw new Error(`Failed to download Slack file (${res.status})`);
+  const ab = await res.arrayBuffer();
+  return {
+    filename: f.name || `file_${fileId}`,
+    mimeType: f.mimetype || 'application/octet-stream',
+    buffer: Buffer.from(ab),
+  };
+}
+
+function extractSlackFileIdsFromView(view) {
+  const values = view?.state?.values || {};
+  for (const blockId of Object.keys(values)) {
+    const block = values[blockId] || {};
+    for (const actionId of Object.keys(block)) {
+      const el = block[actionId];
+      if (!el) continue;
+      // file_input returns either `files: [ {id} ]` or `files: [ 'F123' ]` depending on SDK
+      const files = el.files || el.selected_files || el.file_ids;
+      if (Array.isArray(files) && files.length) {
+        return files.map(x => (typeof x === 'string' ? x : x?.id)).filter(Boolean);
+      }
+    }
+  }
+  return [];
+}
 // Pipelines cache
 const HS_CACHE_MS = 10 * 60 * 1000; // 10 min
 const hsCache = {
@@ -1061,9 +972,7 @@ async function hsCreateNoteAndAssociate({
   const toPlural = hubspot_object_type === "deal" ? "deals" : "tickets";
   const assocTypeId = await hsGetNoteAssociationTypeId(toPlural);
 
-  const titleHtml = `<b>${escapeHtml(note_title || "Note")}</b>`;
-  const bodyHtml = escapeHtml(note_body || "").replace(/\r?\n/g, "<br/>");
-  const combinedBody = `${titleHtml}<br/>${bodyHtml}`;
+  const combinedBody = `<b>${escapeHtml(note_title || 'Note')}</b><br/>${escapeHtml(note_body || '').replace(/\n/g, '<br/>')}`;
 
   const createBody = {
     properties: {
@@ -1699,75 +1608,115 @@ app.options("hubnote_files_select", async ({ ack, body, options, client, logger 
  * This was intentionally added without changing any of the existing lookup/options logic.
  */
 app.view("hubnote_modal_submit_v2", async ({ ack, body, view, client, logger }) => {
-  await ack({ response_action: "clear" });
-
   try {
-    const meta = safeJsonParse(view.private_metadata) || {};
-    const correlationId = meta.correlationId || `hubnote_${crypto.randomBytes(12).toString("hex")}`;
+    const values = (view && view.state && view.state.values) ? view.state.values : {};
 
-    const recordType = findSelectedOptionValue(view.state.values, "hubnote_v2_record_type_select") || meta.recordType || "ticket";
-    const recordId = findSelectedOptionValue(view.state.values, "hubnote_v2_record_select") || meta.recordId || "";
+    const recordType =
+      values.record_type_block_v2?.hubnote_v2_record_type_select?.selected_option?.value || "ticket";
 
-    const noteTitle = (findPlainTextValue(view.state.values, "hubnote_v2_note_title_input") || "").trim();
-    const noteBody = (findPlainTextValue(view.state.values, "hubnote_v2_note_body_input") || "").trim();
+    const pipelineId =
+      values.pipeline_block_v2?.hubnote_v2_pipeline_select?.selected_option?.value || "";
 
-    if (!recordId) {
-      await client.chat.postEphemeral({
-        channel: meta.originChannelId || body.user.id,
-        user: body.user.id,
-        text: "❌ Please select a record before submitting.",
-      });
+    const stageId =
+      values.stage_block_v2?.hubnote_v2_stage_select?.selected_option?.value || "";
+
+    const recordId =
+      values.record_block_v2?.hubnote_v2_record_select?.selected_option?.value || "";
+
+    const noteTitle =
+      values.note_title_block_v2?.hubnote_v2_note_title_input?.value || "";
+
+    const noteBody =
+      values.note_body_block_v2?.hubnote_v2_note_body_input?.value || "";
+
+    // Basic validation (keeps modal open and highlights fields)
+    const errors = {};
+    if (!recordType) errors.record_type_block_v2 = "Please choose Ticket or Deal.";
+    if (!pipelineId) errors.pipeline_block_v2 = "Please choose a pipeline.";
+    if (!stageId) errors.stage_block_v2 = "Please choose a pipeline stage.";
+    if (!recordId) errors.record_block_v2 = "Please choose a record.";
+    if (!noteTitle.trim()) errors.note_title_block_v2 = "Please enter a note title.";
+    if (!noteBody.trim()) errors.note_body_block_v2 = "Please enter a note body.";
+
+    if (Object.keys(errors).length) {
+      await ack({ response_action: "errors", errors });
       return;
     }
 
-    HUBNOTE_PENDING.set(correlationId, {
-      createdAt: Date.now(),
-      originChannelId: meta.originChannelId || "",
-      originUserId: meta.originUserId || body.user.id,
-      recordType,
-      recordId,
-      noteTitle,
-      noteBody,
+    // Create note + associate to Ticket/Deal
+    const noteId = await hsCreateNoteAndAssociate({
+      hubspot_object_type: recordType,
+      hubspot_object_id: recordId,
+      note_title: noteTitle,
+      note_body: noteBody,
     });
 
-    await client.chat.postMessage({
-      channel: body.user.id,
-      text: "📎 Do you want to upload files to attach to this HubSpot note?",
-      blocks: [
-        {
-          type: "section",
-          text: { type: "mrkdwn", text: "📎 *Do you want to upload files to attach to this HubSpot note?*" },
-        },
-        {
-          type: "actions",
-          elements: [
-            {
-              type: "button",
-              action_id: "hubnote_v2_attach_yes",
-              style: "primary",
-              text: { type: "plain_text", text: ":meow_nod: Yes" },
-              value: JSON.stringify({ correlationId }),
+    await ack({ response_action: "clear" });
+
+    // Confirmation + follow-up (DM the user so we don't need an origin channel)
+    // We intentionally do NOT use Slack's `file_input` block element here because it requires the `files:read` scope.
+    // Instead, we offer an optional follow-up flow to add attachment LINKS as a second HubSpot note.
+    const userId = body?.user?.id;
+    if (userId) {
+      const ctx = {
+        recordType,
+        recordId,
+        noteId: noteId || "",
+        noteTitle,
+      };
+
+      await client.chat.postMessage({
+        channel: userId,
+        text: `✅ HubSpot note created and attached to ${recordType} ${recordId}${noteId ? ` (note ${noteId})` : ""}.`,
+        blocks: [
+          {
+            type: "section",
+            text: {
+              type: "mrkdwn",
+              text: `✅ *HubSpot note created!*\n\n:paperclip: Want to attach files to this note?`,
             },
-            {
-              type: "button",
-              action_id: "hubnote_v2_attach_no",
-              style: "danger",
-              text: { type: "plain_text", text: ":bear-headshake: No" },
-              value: JSON.stringify({ correlationId }),
-            },
-          ],
-        },
-      ],
-    });
-  } catch (e) {
-    logger.error(e);
-    try {
-      await client.chat.postEphemeral({
-        channel: body?.user?.id || body?.channel?.id,
-        user: body?.user?.id,
-        text: "❌ Something went wrong saving your note draft. Please try /hubnote again.",
+          },
+          {
+            type: "actions",
+            elements: [
+              {
+                type: "button",
+                action_id: "hubnote_v2_attach_yes",
+                style: "primary",
+                text: { type: "plain_text", text: ":meow_nod: Yes", emoji: true },
+                value: JSON.stringify(ctx),
+              },
+              {
+                type: "button",
+                action_id: "hubnote_v2_attach_no",
+                style: "danger",
+                text: { type: "plain_text", text: ":bear-headshake: No", emoji: true },
+                value: JSON.stringify(ctx),
+              },
+            ],
+          },
+          {
+            type: "context",
+            elements: [
+              {
+                type: "mrkdwn",
+                text: `Upload up to 5 files from Slack and I’ll attach them to the same note.`,
+              },
+            ],
+          },
+        ],
       });
-    } catch (_) {}
+    }
+  } catch (err) {
+    logger?.error?.(err);
+
+    // Keep modal open with a friendly error
+    await ack({
+      response_action: "errors",
+      errors: {
+        note_body_block_v2: "Something went wrong creating the note. Please try again (or contact Trey if it persists).",
+      },
+    });
   }
 });
 
@@ -1791,7 +1740,8 @@ function buildAttachLinksModalV2(privateMetadata) {
           text:
             "Paste *links* to files you want referenced on the HubSpot record (one per line).\n\n" +
             "• Works great for Drive/Dropbox/share links\n" +
-            "• Slack file links are OK too (they'll be saved as links)",
+            "• Slack file links are OK too (they'll be saved as links)\n\n" +
+            "_Tip: If you want true file uploads from Slack into HubSpot, add the `files:read` Slack scope and reinstall the app._",
         },
       },
       {
@@ -1809,21 +1759,21 @@ function buildAttachLinksModalV2(privateMetadata) {
   };
 }
 
-function buildAttachFilesModalV2({ correlationId }) {
+function buildAttachFilesModalV2({ correlationId, noteId }) {
   return {
     type: "modal",
     callback_id: "hubnote_attach_files_submit_v2",
     title: { type: "plain_text", text: "Attach files" },
     submit: { type: "plain_text", text: "Attach" },
     close: { type: "plain_text", text: "Cancel" },
-    private_metadata: JSON.stringify({ correlationId }),
+    private_metadata: JSON.stringify({ correlationId, noteId }),
     blocks: [
       {
         type: "section",
         text: {
           type: "mrkdwn",
           text:
-            "Upload up to 5 files. I’ll upload them into HubSpot Files and attach them to the note you just created.",
+            "Upload up to 5 files. I’ll upload them to HubSpot and attach them to the same note you just created.",
         },
       },
       {
@@ -1847,29 +1797,10 @@ function buildAttachFilesModalV2({ correlationId }) {
 app.action("hubnote_v2_attach_yes", async ({ ack, body, client, logger }) => {
   await ack();
   try {
-    const payload = safeJsonParse(body.actions?.[0]?.value) || {};
-    const { correlationId } = payload;
-    const pending = correlationId ? HUBNOTE_PENDING.get(correlationId) : null;
-
-    if (!pending) {
-      await client.chat.update({
-        channel: body.channel.id,
-        ts: body.message.ts,
-        text: "⚠️ Missing note context. Please run /hubnote again.",
-      });
-      return;
-    }
-
+    const payload = safeJsonParse(body?.actions?.[0]?.value, {}) || {};
     await client.views.open({
       trigger_id: body.trigger_id,
-      view: buildAttachFilesModalV2({ correlationId }),
-    });
-
-    await client.chat.update({
-      channel: body.channel.id,
-      ts: body.message.ts,
-      text: "📎 Upload files in the modal (then Submit).",
-      blocks: [],
+      view: buildAttachFilesModalV2(payload),
     });
   } catch (e) {
     logger.error(e);
@@ -1879,105 +1810,130 @@ app.action("hubnote_v2_attach_yes", async ({ ack, body, client, logger }) => {
 app.action("hubnote_v2_attach_no", async ({ ack, body, client, logger }) => {
   await ack();
   try {
-    const payload = safeJsonParse(body.actions?.[0]?.value) || {};
-    const { correlationId } = payload;
-    const pending = correlationId ? HUBNOTE_PENDING.get(correlationId) : null;
-
-    if (!pending) {
-      await client.chat.update({
-        channel: body.channel.id,
-        ts: body.message.ts,
-        text: "⚠️ Missing note context. Please run /hubnote again.",
-      });
-      return;
-    }
-
-    const { recordType, recordId, noteTitle, noteBody } = pending;
-
-    const htmlBody = `<b>${escapeHtml(noteTitle || "")}</b><br/>${escapeHtml(noteBody || "")}`;
-
-    await hsCreateNoteAndAssociate({
-      recordType,
-      recordId,
-      htmlBody,
-    });
-
-    HUBNOTE_PENDING.delete(correlationId);
-
+    const channel = body?.channel?.id;
+    const ts = body?.message?.ts;
+    if (!channel || !ts) return;
     await client.chat.update({
-      channel: body.channel.id,
-      ts: body.message.ts,
-      text: "✅ Note created (no attachments).",
-      blocks: [],
+      channel,
+      ts,
+      text: "👍 No attachments added.",
+      blocks: [
+        {
+          type: "section",
+          text: { type: "mrkdwn", text: "👍 No attachments added." },
+        },
+      ],
     });
   } catch (e) {
     logger.error(e);
   }
 });
 
-app.view("hubnote_attach_files_submit_v2", async ({ ack, body, view, client, logger }) => {
-  await ack({ response_action: "clear" });
-
+app.view("hubnote_attach_links_submit_v2", async ({ ack, body, view, client, logger }) => {
   try {
-    const payload = safeJsonParse(view.private_metadata) || {};
-    const correlationId = payload.correlationId;
+    const meta = safeJsonParse(view?.private_metadata, {}) || {};
+    const linksRaw =
+      view?.state?.values?.attach_links_block_v2?.hubnote_attach_links_input_v2?.value || "";
+    const links = linksRaw
+      .split(/\r?\n/)
+      .map((s) => s.trim())
+      .filter(Boolean);
 
-    const pending = correlationId ? HUBNOTE_PENDING.get(correlationId) : null;
-    if (!pending) {
-      await client.chat.postEphemeral({
-        channel: body.user.id,
-        user: body.user.id,
-        text: "⚠️ Missing note context. Please run /hubnote again.",
+    if (!links.length) {
+      await ack({
+        response_action: "errors",
+        errors: { attach_links_block_v2: "Please paste at least one link." },
       });
       return;
     }
 
-    // Gather Slack file IDs from the file_input
-    const fileIds = [];
-    const values = view.state.values || {};
-    for (const blockId of Object.keys(values)) {
-      const actions = values[blockId] || {};
-      const a = actions["hubnote_v2_files_input"];
-      if (a?.type === "file_input" && Array.isArray(a.files)) {
-        fileIds.push(...a.files);
+    await ack();
+
+    const recordType = meta.recordType;
+    const recordId = meta.recordId;
+    const originalNoteId = meta.noteId;
+    const noteTitle = meta.noteTitle || "HubSpot Note";
+
+    if (!recordType || !recordId) {
+      // Can't proceed; just DM the user.
+      const userId = body?.user?.id;
+      if (userId) {
+        await client.chat.postMessage({
+          channel: userId,
+          text: "⚠️ I couldn't determine which HubSpot record to attach links to.",
+        });
       }
-    }
-
-    if (fileIds.length === 0) {
-      await client.chat.postMessage({
-        channel: body.user.id,
-        text: "⚠️ No files were uploaded. Please try again.",
-      });
       return;
     }
 
-    const uploadedHubSpotFileIds = [];
-    for (const slackFileId of fileIds.slice(0, 5)) {
-      const { buffer, filename, mimetype } = await slackDownloadFileBuffer({ client, fileId: slackFileId });
-      const hs = await hsUploadFileToHubSpot({
-        filename,
-        fileBuffer: buffer,
-        mimeType: mimetype,
-      });
-      // Files API returns an object with id
-      if (hs?.id) uploadedHubSpotFileIds.push(String(hs.id));
-    }
+    const bodyText =
+      `📎 Attachments for: ${noteTitle}` +
+      (originalNoteId ? ` (original note: ${originalNoteId})` : "") +
+      "\n\n" +
+      links.map((u) => `• ${u}`).join("\n");
 
-    const { recordType, recordId, noteTitle, noteBody } = pending;
-    const htmlBody = `<b>${escapeHtml(noteTitle || "")}</b><br/>${escapeHtml(noteBody || "")}`;
-
-    await hsCreateEngagementNoteWithAttachments({
-      recordType,
-      recordId,
-      htmlBody,
-      fileIds: uploadedHubSpotFileIds,
+    const attachmentNoteId = await hsCreateNoteAndAssociate({
+      hubspot_object_type: recordType,
+      hubspot_object_id: recordId,
+      note_title: `📎 Attachments — ${noteTitle}`,
+      note_body: bodyText,
     });
 
-    HUBNOTE_PENDING.delete(correlationId);
+    // DM confirmation
+    const userId = body?.user?.id;
+    if (userId) {
+      await client.chat.postMessage({
+        channel: userId,
+        text: `✅ Added attachment links as a new HubSpot note${attachmentNoteId ? ` (note ${attachmentNoteId})` : ""}.`,
+      });
+    }
+  } catch (e) {
+    logger.error(e);
+    await ack({
+      response_action: "errors",
+      errors: { attach_links_block_v2: "Something went wrong. Please try again." },
+    });
+  }
+});
+
+
+// Upload Slack files into HubSpot Files, then attach them to the *same* note via hs_attachment_ids.
+app.view("hubnote_attach_files_submit_v2", async ({ ack, body, view, client, logger }) => {
+  await ack();
+
+  try {
+    const meta = safeJsonParse(view.private_metadata, {});
+    const noteId = meta?.noteId;
+
+    if (!noteId) {
+      await client.chat.postMessage({
+        channel: body.user.id,
+        text: "❌ Missing note context. Please run /hubnote again.",
+      });
+      return;
+    }
+
+    const fileIds = extractSlackFileIdsFromView(view);
+    if (!fileIds.length) {
+      await client.chat.postMessage({
+        channel: body.user.id,
+        text: "No files selected — nothing to attach.",
+      });
+      return;
+    }
+
+    const uploadedIds = [];
+    for (const fid of fileIds) {
+      const { filename, mimeType, buffer } = await slackDownloadFileToBuffer(client, fid);
+      const hsFile = await hsUploadFileFromBuffer({ filename, mimeType, buffer });
+      if (hsFile?.id) uploadedIds.push(String(hsFile.id));
+    }
+
+    await hsAppendAttachmentsToNote(noteId, uploadedIds);
 
     await client.chat.postMessage({
       channel: body.user.id,
-      text: "✅ Note created with attachments.",
+      text: `✅ Attached ${uploadedIds.length} file${uploadedIds.length === 1 ? '' : 's'} to the HubSpot note.`,
     });
   } catch (e) {
     logger.error(e);
@@ -1989,51 +1945,6 @@ app.view("hubnote_attach_files_submit_v2", async ({ ack, body, view, client, log
     } catch (_) {}
   }
 });
-
-async function hubspotUploadFile(buffer, filename, mime) {
-  if (!HUBSPOT_ACCESS_TOKEN) throw new Error("Missing HUBSPOT_ACCESS_TOKEN");
-
-  const fd = new FormData();
-  const blob = new Blob([buffer], { type: mime || "application/octet-stream" });
-  fd.append("file", blob, filename);
-  fd.append("options", JSON.stringify({ access: "PRIVATE", overwrite: false }));
-
-  const res = await fetch("https://api.hubapi.com/files/v3/files", {
-    method: "POST",
-    headers: {
-      Authorization: `Bearer ${HUBSPOT_ACCESS_TOKEN}`,
-    },
-    body: fd,
-  });
-
-  const json = await res.json().catch(() => ({}));
-  if (!res.ok) {
-    const msg = json?.message || `HubSpot file upload failed (${res.status})`;
-    throw new Error(msg);
-  }
-
-  // HubSpot returns numeric id
-  return json.id;
-}
-
-async function hubspotAppendAttachmentsToNote(noteId, newIds) {
-  if (!Array.isArray(newIds) || newIds.length === 0) return;
-
-  // Read current attachment ids (if any)
-  const getUrl = `https://api.hubapi.com/crm/v3/objects/notes/${noteId}?properties=hs_attachment_ids`;
-  const getRes = await axios.get(getUrl, {
-    headers: { Authorization: `Bearer ${HUBSPOT_ACCESS_TOKEN}` },
-    timeout: 10000,
-  });
-
-  const existingRaw = (getRes.data?.properties?.hs_attachment_ids || "").trim();
-  const existingIds = existingRaw ? existingRaw.split(";").filter(Boolean) : [];
-
-  const merged = Array.from(new Set([...existingIds, ...newIds.map(String)])).join(";");
-
-  await hsUpdateNote(noteId, { hs_attachment_ids: merged });
-}
-
 
 // ==============================
 // START SERVER
