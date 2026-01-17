@@ -755,21 +755,15 @@ async function hubspotRequest(method, path, data, opts = {}) {
 
   const url = `https://api.hubapi.com${path}`;
 
-  // Support query params (e.g., { properties: 'hs_attachment_ids' })
-  const params = { ...(opts.params || {}) };
-  if (opts.properties) params.properties = opts.properties;
-
   const res = await axios({
     method,
     url,
     data,
-    params,
     headers: {
       Authorization: `Bearer ${HUBSPOT_PRIVATE_APP_TOKEN}`,
       "Content-Type": "application/json",
-      ...(opts.headers || {}),
     },
-    timeout: opts.timeout || 20000,
+    timeout: 20000,
   });
   return res.data;
 }
@@ -790,12 +784,8 @@ async function hsUploadFileFromBuffer({ filename, buffer, mimeType }) {
   // HubSpot Files API requires either folderId or folderPath
   const folderId = process.env.HUBSPOT_FILES_FOLDER_ID;
   const folderPath = process.env.HUBSPOT_FILES_FOLDER_PATH;
-  if (folderId) {
-    fd.append('folderId', String(folderId));
-  } else {
-    // Default folder path if none provided
-    fd.append('folderPath', folderPath || '/Syllabot Uploads');
-  }
+  if (folderId) fd.append('folderId', String(folderId));
+  else fd.append('folderPath', folderPath || '/Syllabot Uploads');
 
   const res = await fetch('https://api.hubapi.com/files/v3/files', {
     method: 'POST',
@@ -1326,7 +1316,7 @@ app.action("hubnote_add_files_yes", async ({ ack, body, client, logger }) => {
 
     await client.views.open({
       trigger_id: body.trigger_id,
-      view: buildAttachLinksModalV2({ sessionId }),
+      view: buildAttachFilesModalV2({ correlationId: session.correlationId, noteId: session.hubspotNoteId }),
     });
   } catch (e) {
     logger.error(e);
@@ -1921,7 +1911,17 @@ app.view("hubnote_attach_files_submit_v2", async ({ ack, body, view, client, log
     const meta = safeJsonParse(view.private_metadata, {});
     const noteId = meta?.noteId;
 
-    if (!noteId) {
+    
+
+    const noteIdStr = String(noteId || '');
+    if (!/^\d+$/.test(noteIdStr)) {
+      await client.chat.postMessage({
+        channel: body.user.id,
+        text: `❌ Invalid HubSpot note id (got: ${noteIdStr || 'empty'}). Please run /hubnote again.`,
+      });
+      return;
+    }
+if (!noteId) {
       await client.chat.postMessage({
         channel: body.user.id,
         text: "❌ Missing note context. Please run /hubnote again.",
@@ -1945,7 +1945,7 @@ app.view("hubnote_attach_files_submit_v2", async ({ ack, body, view, client, log
       if (hsFile?.id) uploadedIds.push(String(hsFile.id));
     }
 
-    await hsAppendAttachmentsToNote(noteId, uploadedIds);
+    await hsAppendAttachmentsToNote(noteIdStr, uploadedIds);
 
     await client.chat.postMessage({
       channel: body.user.id,
