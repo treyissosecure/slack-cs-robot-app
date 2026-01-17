@@ -1338,7 +1338,7 @@ app.action("hubnote_add_files_yes", async ({ ack, body, client, logger }) => {
 app.options("hubnote_v2_pipeline_select", async ({ body, options, ack, logger }) => {
   try {
     const meta = parsePrivateMetadata(body?.view?.private_metadata);
-    const recordType = meta.recordType || "ticket";
+    const recordType = ctx.recordType || "ticket";
     const q = (options?.value || "").trim().toLowerCase();
 
     const pipelines = await hsGetPipelines(recordType);
@@ -1380,7 +1380,7 @@ app.options("hubnote_v2_pipeline_select", async ({ body, options, ack, logger })
 app.options("hubnote_v2_stage_select", async ({ body, options, ack, logger }) => {
   try {
     const meta = parsePrivateMetadata(body?.view?.private_metadata);
-    const recordType = meta.recordType || "ticket";
+    const recordType = ctx.recordType || "ticket";
     const pipelineId = meta.pipelineId || "";
     const q = (options?.value || "").trim().toLowerCase();
 
@@ -1427,7 +1427,7 @@ app.options("hubnote_v2_stage_select", async ({ body, options, ack, logger }) =>
 app.options("hubnote_v2_record_select", async ({ body, options, ack, logger }) => {
   try {
     const meta = parsePrivateMetadata(body?.view?.private_metadata);
-    const recordType = meta.recordType || "ticket";
+    const recordType = ctx.recordType || "ticket";
     const pipelineId = meta.pipelineId || "";
     const stageId = meta.stageId || "";
     const q = options?.value || "";
@@ -1486,12 +1486,12 @@ app.action("hubnote_v2_record_type_select", async ({ ack, body, client, logger }
     if (!view?.id) return;
 
     const meta = parsePrivateMetadata(view.private_metadata);
-    meta.recordType = selected;
+    ctx.recordType = selected;
 
     // reset downstream
     meta.pipelineId = "";
     meta.stageId = "";
-    meta.recordId = "";
+    ctx.recordId = "";
 
     await client.views.update({
       view_id: view.id,
@@ -1515,7 +1515,7 @@ app.action("hubnote_v2_pipeline_select", async ({ ack, body, client, logger }) =
 
     // reset downstream
     meta.stageId = "";
-    meta.recordId = "";
+    ctx.recordId = "";
 
     await client.views.update({
       view_id: view.id,
@@ -1538,7 +1538,7 @@ app.action("hubnote_v2_stage_select", async ({ ack, body, client, logger }) => {
     meta.stageId = selected;
 
     // reset downstream
-    meta.recordId = "";
+    ctx.recordId = "";
 
     await client.views.update({
       view_id: view.id,
@@ -1666,8 +1666,8 @@ app.view("hubnote_modal_submit_v2", async ({ ack, body, view, client, logger }) 
     await ack({ response_action: "clear" });
 
     // Confirmation + follow-up (DM the user so we don't need an origin channel)
-    // We intentionally do NOT use Slack's `file_input` block element here because it requires the `files:read` scope.
-    // Instead, we offer an optional follow-up flow to add attachment LINKS as a second HubSpot note.
+    // This follow-up uses Slack's `file_input` block element (requires Slack scopes `files:read` + `files:write`).
+    // Files are uploaded into HubSpot Files and attached to the SAME note we just created.
     const userId = body?.user?.id;
     if (userId) {
       const ctx = {
@@ -1696,14 +1696,14 @@ app.view("hubnote_modal_submit_v2", async ({ ack, body, view, client, logger }) 
                 action_id: "hubnote_v2_attach_yes",
                 style: "primary",
                 text: { type: "plain_text", text: ":meow_nod: Yes", emoji: true },
-                value: JSON.stringify(ctx),
+                value: JSON.stringify({ correlationId }),
               },
               {
                 type: "button",
                 action_id: "hubnote_v2_attach_no",
                 style: "danger",
                 text: { type: "plain_text", text: ":bear-headshake: No", emoji: true },
-                value: JSON.stringify(ctx),
+                value: JSON.stringify({ correlationId }),
               },
             ],
           },
@@ -1761,21 +1761,21 @@ function buildAttachLinksModalV2(privateMetadata) {
   };
 }
 
-function buildAttachFilesModalV2({ correlationId, noteId }) {
+function buildAttachFilesModalV2({ correlationId }) {
   return {
     type: "modal",
     callback_id: "hubnote_attach_files_submit_v2",
     title: { type: "plain_text", text: "Attach files" },
     submit: { type: "plain_text", text: "Attach" },
     close: { type: "plain_text", text: "Cancel" },
-    private_metadata: JSON.stringify({ correlationId, noteId }),
+    private_metadata: JSON.stringify({ correlationId }),
     blocks: [
       {
         type: "section",
         text: {
           type: "mrkdwn",
           text:
-            "Upload up to 5 files. I’ll add them to the HubSpot note as links (you can also drag/drop into HubSpot if you prefer).",
+            "Upload up to 5 files. I’ll upload them into HubSpot Files and attach them to the note you just created.",
         },
       },
       {
@@ -1851,8 +1851,8 @@ app.view("hubnote_attach_links_submit_v2", async ({ ack, body, view, client, log
 
     await ack();
 
-    const recordType = meta.recordType;
-    const recordId = meta.recordId;
+    const recordType = ctx.recordType;
+    const recordId = ctx.recordId;
     const originalNoteId = meta.noteId;
     const noteTitle = meta.noteTitle || "HubSpot Note";
 
@@ -1905,7 +1905,8 @@ app.view("hubnote_attach_files_submit_v2", async ({ ack, body, view, client, log
     const noteId = meta.noteId;
     const noteTitle = meta.noteTitle || "HubSpot Note";
     const noteIdStr = String(noteId || "").trim();
-    if (!noteIdStr || !/^\d+$/.test(noteIdStr)) {
+    // HubSpot note IDs are usually numeric, but we only hard-require that we actually have one.
+    if (!noteIdStr) {
       await ack({
         response_action: "errors",
         errors: { files_block_v2: "Missing note context. Please run /hubnote again." },
