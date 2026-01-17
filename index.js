@@ -759,8 +759,10 @@ async function hubspotRequest(method, path, data) {
     method,
     url,
     data,
+    params: opts.params || undefined,
     headers: {
       Authorization: `Bearer ${HUBSPOT_PRIVATE_APP_TOKEN}`,
+      ...((opts.headers) || {}),
       "Content-Type": "application/json",
     },
     timeout: 20000,
@@ -780,12 +782,17 @@ async function hsUploadFileFromBuffer({ filename, buffer, mimeType }) {
   fd.append('file', blob, filename);
   fd.append('fileName', filename);
   fd.append('options', JSON.stringify({ access: 'PRIVATE', overwrite: false }));
+
   // HubSpot Files API requires either folderId or folderPath
-  // Set HUBSPOT_FILES_FOLDER_PATH (e.g., /Syllabot Uploads) or HUBSPOT_FILES_FOLDER_ID in Render env vars
-  const folderPath = process.env.HUBSPOT_FILES_FOLDER_PATH;
+  // Set HUBSPOT_FILES_FOLDER_ID or HUBSPOT_FILES_FOLDER_PATH in Render env vars
   const folderId = process.env.HUBSPOT_FILES_FOLDER_ID;
-  if (folderId) fd.append('folderId', folderId);
-  else fd.append('folderPath', folderPath || '/Syllabot Uploads');
+  const folderPath = process.env.HUBSPOT_FILES_FOLDER_PATH;
+  if (folderId && String(folderId).trim()) {
+    fd.append('folderId', String(folderId).trim());
+  } else {
+    fd.append('folderPath', String(folderPath || '/Syllabot Uploads'));
+  }
+
 
   const res = await fetch('https://api.hubapi.com/files/v3/files', {
     method: 'POST',
@@ -810,9 +817,7 @@ async function hsAppendAttachmentsToNote(noteId, attachmentIds) {
   if (!noteId) throw new Error('Missing noteId');
   if (!attachmentIds?.length) return;
 
-  const current = await hubspotRequest('GET', `/crm/v3/objects/notes/${noteId}`, null, {
-    properties: 'hs_attachment_ids',
-  }).catch(() => null);
+  const current = await hubspotRequest('GET', `/crm/v3/objects/notes/${noteId}`, null, { params: { properties: 'hs_attachment_ids' } }).catch(() => null);
 
   const existing = (current?.properties?.hs_attachment_ids || '').split(';').map(s => s.trim()).filter(Boolean);
   const merged = Array.from(new Set([...existing, ...attachmentIds.map(String)])).filter(Boolean);
@@ -1094,6 +1099,27 @@ receiver.app.post("/api/hubnote/create", express.json(), async (req, res) => {
       note_title,
       note_body,
     });
+
+    // FALLBACK: send Add Files prompt directly from Step 2 (keeps the SAME UI).
+    // This makes the flow resilient if Zap Step 3 is disabled or misconfigured.
+    try {
+      const sessionId = hubnoteMakeId('hubnote_session');
+      hubnoteSetSession(sessionId, {
+        correlationId: correlation_id || '',
+        hubspotNoteId: String(created.hubspot_note_id),
+        hubspotObjectType: hubspot_object_type === 'deal' ? 'deal' : 'ticket',
+        hubspotObjectId: hubspot_object_id ? String(hubspot_object_id) : '',
+        originChannelId: origin_channel_id,
+        originUserId: origin_user_id,
+      });
+      await app.client.chat.postEphemeral({
+        channel: origin_channel_id,
+        user: origin_user_id,
+        ...buildHubnoteAddFilesEphemeral({ sessionId }),
+      });
+    } catch (e) {
+      console.error('[hubnote step2 fallback] failed to post Add Files prompt:', e?.message || e);
+    }
 
     // Return what Zap Step 3 needs to call /zapier/hubnote/callback
     return res.status(200).json({
