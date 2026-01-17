@@ -742,6 +742,12 @@ app.view("cstask_modal_submit", async ({ ack, body, view, client, logger }) => {
         monday_group_id: groupId,
         status_label: statusLabel,
         priority_label: priorityLabel,
+        // Back-compat + easier Zapier mapping (some Zaps may expect different keys)
+        priority: priorityLabel,
+        monday_priority_label: priorityLabel,
+        priority_text: priorityLabel,
+        // Monday 'priority' column often accepts a JSON value with a label
+        monday_priority_value_json: JSON.stringify({ label: priorityLabel }),
         submitted_by_slack_user_id: body.user.id,
         submitted_at: nowIso(),
       },
