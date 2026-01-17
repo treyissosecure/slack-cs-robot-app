@@ -370,6 +370,61 @@ function nowIso() {
   return new Date().toISOString();
 }
 
+
+// -----------------------------
+// /cstask helpers (normalize values for Zapier/Monday)
+// -----------------------------
+function normalizeSlackSelectLabel(selectedOption) {
+  // Accepts Slack selected_option object, or strings/JSON strings.
+  try {
+    if (!selectedOption) return "";
+    // If it's already a string, try parse JSON (some apps put JSON in value)
+    if (typeof selectedOption === "string") {
+      const s = selectedOption.trim();
+      if (!s) return "";
+      if ((s.startsWith("{") && s.endsWith("}")) || (s.startsWith("[") && s.endsWith("]"))) {
+        const parsed = JSON.parse(s);
+        return normalizeSlackSelectLabel(parsed);
+      }
+      return s;
+    }
+    // If Slack option object
+    if (typeof selectedOption === "object") {
+      const txt = selectedOption.text?.text;
+      if (txt) return String(txt);
+      const val = selectedOption.value;
+      if (val == null) return "";
+      return normalizeSlackSelectLabel(val);
+    }
+  } catch (_) {}
+  return "";
+}
+
+function extractPlainTextSlackRichValue(value) {
+  // For plain_text_input -> string; for rich_text-like objects -> attempt to flatten to text.
+  if (value == null) return "";
+  if (typeof value === "string") return value;
+  try {
+    const acc = [];
+    const walk = (node) => {
+      if (!node) return;
+      if (typeof node === "string") { acc.push(node); return; }
+      if (Array.isArray(node)) { node.forEach(walk); return; }
+      if (typeof node === "object") {
+        if (node.text) acc.push(String(node.text));
+        if (node.elements) walk(node.elements);
+        if (node.value) walk(node.value);
+      }
+    };
+    walk(value);
+    const out = acc.join("").replace(/\s+/g, " ").trim();
+    return out || JSON.stringify(value);
+  } catch (_) {
+    return String(value);
+  }
+}
+
+
 // ==============================
 // MONDAY API HELPERS
 // ==============================
@@ -680,15 +735,13 @@ app.view("cstask_modal_submit", async ({ ack, body, view, client, logger }) => {
   const groupId =
     view.state.values.group_block.group_select.selected_option?.value || "";
 
-  const statusLabel =
-    view.state.values.status_block.status_select.selected_option?.text?.text ||
-    view.state.values.status_block.status_select.selected_option?.value ||
-    "";
+  const statusLabel = normalizeSlackSelectLabel(
+    view.state.values.status_block.status_select.selected_option
+  );
 
-  const priorityLabel =
-    view.state.values.priority_block.priority_select.selected_option?.text?.text ||
-    view.state.values.priority_block.priority_select.selected_option?.value ||
-    "";
+  const priorityLabel = normalizeSlackSelectLabel(
+    view.state.values.priority_block.priority_select.selected_option
+  );
 
   const errors = {};
   if (!taskName) errors["task_name_block"] = "Task name is required.";
@@ -735,13 +788,13 @@ app.view("cstask_modal_submit", async ({ ack, body, view, client, logger }) => {
     await axios.post(
       ZAPIER_WEBHOOK_URL,
       {
-        task_name: taskName,
-        description,
-        status_label: statusLabel,
-        priority_label: priorityLabel,
-        monday_board_id: boardId,
-        monday_group_id: groupId,
-        task_owner_slack_user_id: body.user.id,
+        description: String(description || ""),
+        status_label: String(statusLabel || ""),
+        priority_label: String(priorityLabel || ""),
+        monday_board_id: String(boardId || ""),
+        monday_group_id: String(groupId || ""),
+        task_name: String(taskName || ""),
+        task_owner_slack_user_id: String(body.user.id || ""),
       },
       { headers: { "Content-Type": "application/json" }, timeout: 10000 }
     );
