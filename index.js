@@ -1809,14 +1809,14 @@ function buildAttachLinksModalV2(privateMetadata) {
   };
 }
 
-function buildAttachFilesModalV2({ correlationId, noteId, noteTitle, recordType, recordId }) {
+function buildAttachFilesModalV2({ correlationId }) {
   return {
     type: "modal",
     callback_id: "hubnote_attach_files_submit_v2",
     title: { type: "plain_text", text: "Attach files" },
     submit: { type: "plain_text", text: "Attach" },
     close: { type: "plain_text", text: "Cancel" },
-    private_metadata: JSON.stringify({ correlationId: payload.correlationId }),
+    private_metadata: JSON.stringify({ correlationId }),
     blocks: [
       {
         type: "section",
@@ -2034,127 +2034,6 @@ async function hubspotAppendAttachmentsToNote(noteId, newIds) {
   await hsUpdateNote(noteId, { hs_attachment_ids: merged });
 }
 
-// Attach Slack-uploaded files to the SAME HubSpot note (hs_attachment_ids)
-app.view("hubnote_attach_files_submit_v2", async ({ ack, body, view, client, logger }) => {
-  try {
-    const meta = safeJsonParse(view?.private_metadata, {}) || {};
-    const noteId = meta.noteId;
-    const noteTitle = meta.noteTitle || "HubSpot Note";
-    const noteIdStr = String(noteId || "").trim();
-    // HubSpot note IDs are usually numeric, but we only hard-require that we actually have one.
-    if (!noteIdStr) {
-      await ack({
-        response_action: "errors",
-        errors: { files_block_v2: "Missing note context. Please run /hubnote again." },
-      });
-      return;
-    }
-
-    // Extract Slack file IDs from the file_input element
-    const state = view?.state?.values || {};
-    let slackFileIds = [];
-    for (const block of Object.values(state)) {
-      for (const action of Object.values(block || {})) {
-        if (action?.type === "file_input" && Array.isArray(action?.files) && action.files.length) {
-          slackFileIds = action.files;
-          break;
-        }
-      }
-      if (slackFileIds.length) break;
-    }
-
-    if (!slackFileIds.length) {
-      await ack({
-        response_action: "errors",
-        errors: { files_block_v2: "Please upload at least one file." },
-      });
-      return;
-    }
-
-    await ack();
-
-    // Fetch existing note props so we can append attachments + optionally append a link list.
-    const existing = await hubspotRequest(
-      "GET",
-      `/crm/v3/objects/notes/${encodeURIComponent(noteIdStr)}?properties=hs_attachment_ids,hs_note_body`
-    );
-    const existingAttach = (existing?.properties?.hs_attachment_ids || "").trim();
-    const existingBody = existing?.properties?.hs_note_body || "";
-
-    const uploadedHubSpotFiles = [];
-    for (const slackFileId of slackFileIds) {
-      try {
-        const { buffer, filename, mimeType } = await slackDownloadFile({ client, slackFileId });
-        const uploaded = await hsUploadFileToHubSpot({
-          buffer,
-          filename,
-          mimeType,
-          folderPath: "/SyllaBot Uploads",
-        });
-        uploadedHubSpotFiles.push(uploaded);
-      } catch (e) {
-        logger.error(e);
-      }
-    }
-
-    if (!uploadedHubSpotFiles.length) {
-      const userId = body?.user?.id;
-      if (userId) {
-        await client.chat.postMessage({
-          channel: userId,
-          text: "❌ I couldn't upload any of the files to HubSpot. Please try again.",
-        });
-      }
-      return;
-    }
-
-    const newIds = uploadedHubSpotFiles.map((f) => String(f.id)).filter(Boolean);
-    const combinedIds = [
-      ...existingAttach
-        .split(";")
-        .map((s) => s.trim())
-        .filter(Boolean),
-      ...newIds,
-    ];
-    const uniqueIds = Array.from(new Set(combinedIds));
-
-    // Optional: also append a human-friendly list of file links into the note body.
-    const linkLinesHtml = uploadedHubSpotFiles
-      .map((f) => {
-        if (!f?.url) return null;
-        const name = escapeHtml(f.name || "File");
-        const url = escapeHtml(f.url);
-        return `• ${name}: ${url}`;
-      })
-      .filter(Boolean)
-      .join("<br/>");
-
-    const appendedBody = linkLinesHtml
-      ? `${existingBody || ""}<br/><br/>📎 Attachments added via Slack:<br/>${linkLinesHtml}`.trim()
-      : existingBody;
-
-    await hsPatchNote(noteIdStr, {
-      hs_attachment_ids: uniqueIds.join(";"),
-      ...(appendedBody ? { hs_note_body: appendedBody } : {}),
-    });
-
-    const userId = body?.user?.id;
-    if (userId) {
-      await client.chat.postMessage({
-        channel: userId,
-        text: `✅ Attached ${uploadedHubSpotFiles.length} file(s) to the original note: ${noteTitle}`,
-      });
-    }
-  } catch (e) {
-    logger.error(e);
-    try {
-      await ack({
-        response_action: "errors",
-        errors: { files_block_v2: "Something went wrong. Please try again." },
-      });
-    } catch {}
-  }
-});
 
 // ==============================
 // START SERVER
