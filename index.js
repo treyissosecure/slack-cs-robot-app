@@ -273,6 +273,29 @@ function parsePrivateMetadata(md) {
   }
 }
 
+
+function normalizeHubspotNoteId(value) {
+  // Accept: "123", 123, {hubspot_note_id:"123"}, {noteId:"123"}, JSON string of either shape
+  try {
+    if (typeof value === "string") {
+      const trimmed = value.trim();
+      if (!trimmed) return "";
+      // If JSON string, parse and recurse
+      if ((trimmed.startsWith("{") && trimmed.endsWith("}")) || (trimmed.startsWith("[") && trimmed.endsWith("]"))) {
+        return normalizeHubspotNoteId(JSON.parse(trimmed));
+      }
+      return trimmed;
+    }
+    if (typeof value === "number") return String(value);
+    if (value && typeof value === "object") {
+      if (value.hubspot_note_id) return String(value.hubspot_note_id);
+      if (value.noteId) return normalizeHubspotNoteId(value.noteId);
+    }
+  } catch (_) {}
+  return "";
+}
+
+
 // Safe JSON helpers for private_metadata and other small payloads.
 function safeJsonParse(str, fallback = {}) {
   try {
@@ -749,6 +772,7 @@ app.view("cstask_modal_submit", async ({ ack, body, view, client, logger }) => {
 // HUBSPOT HELPERS (HubNote v2)
 // ==============================
 async function hubspotRequest(method, path, data, opts = {}) {
+  opts = opts || {};
   if (!HUBSPOT_PRIVATE_APP_TOKEN) {
     throw new Error("Missing HUBSPOT_PRIVATE_APP_TOKEN");
   }
@@ -780,12 +804,14 @@ async function hsUploadFileFromBuffer({ filename, buffer, mimeType }) {
   fd.append('file', blob, filename);
   fd.append('fileName', filename);
   fd.append('options', JSON.stringify({ access: 'PRIVATE', overwrite: false }));
-
   // HubSpot Files API requires either folderId or folderPath
   const folderId = process.env.HUBSPOT_FILES_FOLDER_ID;
   const folderPath = process.env.HUBSPOT_FILES_FOLDER_PATH;
-  if (folderId) fd.append('folderId', String(folderId));
-  else fd.append('folderPath', folderPath || '/Syllabot Uploads');
+  if (folderId) {
+    fd.append('folderId', String(folderId));
+  } else {
+    fd.append('folderPath', folderPath || '/Syllabot Uploads');
+  }
 
   const res = await fetch('https://api.hubapi.com/files/v3/files', {
     method: 'POST',
@@ -1316,7 +1342,7 @@ app.action("hubnote_add_files_yes", async ({ ack, body, client, logger }) => {
 
     await client.views.open({
       trigger_id: body.trigger_id,
-      view: buildAttachFilesModalV2({ correlationId: session.correlationId, noteId: session.hubspotNoteId }),
+      view: buildAttachLinksModalV2({ sessionId }),
     });
   } catch (e) {
     logger.error(e);
@@ -1909,19 +1935,10 @@ app.view("hubnote_attach_files_submit_v2", async ({ ack, body, view, client, log
 
   try {
     const meta = safeJsonParse(view.private_metadata, {});
-    const noteId = meta?.noteId;
+    const noteIdRaw = meta?.noteId;
+  const noteId = normalizeHubspotNoteId(noteIdRaw);
 
-    
-
-    const noteIdStr = String(noteId || '');
-    if (!/^\d+$/.test(noteIdStr)) {
-      await client.chat.postMessage({
-        channel: body.user.id,
-        text: `❌ Invalid HubSpot note id (got: ${noteIdStr || 'empty'}). Please run /hubnote again.`,
-      });
-      return;
-    }
-if (!noteId) {
+    if (!noteId) {
       await client.chat.postMessage({
         channel: body.user.id,
         text: "❌ Missing note context. Please run /hubnote again.",
@@ -1945,7 +1962,7 @@ if (!noteId) {
       if (hsFile?.id) uploadedIds.push(String(hsFile.id));
     }
 
-    await hsAppendAttachmentsToNote(noteIdStr, uploadedIds);
+    await hsAppendAttachmentsToNote(noteId, uploadedIds);
 
     await client.chat.postMessage({
       channel: body.user.id,
