@@ -780,6 +780,12 @@ async function hsUploadFileFromBuffer({ filename, buffer, mimeType }) {
   fd.append('file', blob, filename);
   fd.append('fileName', filename);
   fd.append('options', JSON.stringify({ access: 'PRIVATE', overwrite: false }));
+  // HubSpot Files API requires either folderId or folderPath
+  // Set HUBSPOT_FILES_FOLDER_PATH (e.g., /Syllabot Uploads) or HUBSPOT_FILES_FOLDER_ID in Render env vars
+  const folderPath = process.env.HUBSPOT_FILES_FOLDER_PATH;
+  const folderId = process.env.HUBSPOT_FILES_FOLDER_ID;
+  if (folderId) fd.append('folderId', folderId);
+  else fd.append('folderPath', folderPath || '/Syllabot Uploads');
 
   const res = await fetch('https://api.hubapi.com/files/v3/files', {
     method: 'POST',
