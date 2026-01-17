@@ -487,6 +487,18 @@ function findSelectedOptionValue(viewStateValues, actionId) {
   return "";
 }
 
+// Slack view.state.values can shift if block_id changes.
+// This helper finds plain_text_input.value by action_id regardless of block_id.
+function findPlainTextValue(viewStateValues, actionId) {
+  const blocks = viewStateValues || {};
+  for (const blockId of Object.keys(blocks)) {
+    const actions = blocks[blockId] || {};
+    const v = actions[actionId]?.value;
+    if (typeof v === "string" && v.length) return v;
+  }
+  return "";
+}
+
 // Finds Slack file IDs from view.state.values regardless of block_id
 function findFileIds(viewStateValues, actionId) {
   const blocks = viewStateValues || {};
