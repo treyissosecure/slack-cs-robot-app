@@ -2042,8 +2042,76 @@ app.view("hubnote_attach_files_submit_v2", async ({ ack, body, view, client, log
 });
 
 // ==============================
+// CURTSY TASK
+// ==============================
+app.event("reaction_added", async ({ event, client, logger }) => {
+  try {
+    if (event.reaction !== "curtsy") return;
+
+    const channel = event.item?.channel;
+    const messageTs = event.item?.ts;
+    const reactingUser = event.user;
+
+    if (!channel || !messageTs) return;
+
+    await client.chat.postMessage({
+      channel,
+      thread_ts: messageTs,
+      text: "Create a HubSpot task from this?",
+      blocks: [
+        {
+          type: "section",
+          text: {
+            type: "mrkdwn",
+            text: "Create a HubSpot task?",
+          },
+        },
+        {
+          type: "actions",
+          elements: [
+            {
+              type: "button",
+              action_id: "hubtask_open_from_reaction",
+              style: "primary",
+              text: { type: "plain_text", text: "Create Task" },
+              value: JSON.stringify({
+                channel,
+                messageTs,
+                reactingUser,
+              }),
+            },
+          ],
+        },
+      ],
+    });
+  } catch (e) {
+    logger.error(e);
+  }
+});
+
+app.action("hubtask_open_from_reaction", async ({ ack, body, client, logger }) => {
+  await ack();
+
+  try {
+    const ctx = JSON.parse(body.actions?.[0]?.value || "{}");
+
+    await client.views.open({
+      trigger_id: body.trigger_id,
+      view: buildHubtaskModal({
+        correlationId: `hubtask_${Date.now()}`,
+        originChannelId: ctx.channel,
+        originUserId: body.user.id,
+      }),
+    });
+  } catch (e) {
+    logger.error(e);
+  }
+});
+
+// ==============================
 // START SERVER
 // ==============================
+
 (async () => {
   await app.start(process.env.PORT || 3000);
   console.log("⚡️ SyllaBot is running (cstask + hubnote v2)");
