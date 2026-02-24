@@ -73,6 +73,7 @@ const receiver = new ExpressReceiver({
   endpoints: {
     commands: "/slack/commands",
     actions: "/slack/interactions", // interactive + options load URL
+    events: "/slack/events",   //
   },
 });
 
