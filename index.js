@@ -116,6 +116,7 @@ const app = new App({
   logLevel: LogLevel.DEBUG,
 });
 
+
 // --------------------------------
 // Hubnote v2 modal builder (REQUIRED)
 // Paste ABOVE app.command("/hubnote"...)
@@ -842,6 +843,15 @@ async function hubspotRequest(method, path, data, opts = {}) {
   });
   return res.data;
 }
+
+const { registerHubtask } = require("./features/hubtask");
+
+registerHubtask({
+  app,
+  hubspotRequest,
+  parsePrivateMetadata,
+  buildCleanViewPayload,
+});
 
 
 // ==============================
